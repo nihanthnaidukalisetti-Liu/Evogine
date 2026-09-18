@@ -221,9 +221,10 @@ class Engine:
     def promote(self, learning_id: str, replay_evidence: RecordCounterfactual) -> LearningRecord:
         """Promote ``learning_id`` to ``promoted`` given passing replay evidence.
 
-        Called only after the memory gate accepts ``replay_evidence`` —
-        a material verdict change on the queued counterfactual runs. The
-        store re-checks the invariants the gate is supposed to enforce:
+        Called only after a human approves the promotion proposal the memory
+        gate rendered (V2-6) — the applied evidence is the gate's cleared
+        trail: a material verdict change on the queued counterfactual runs.
+        The store re-checks the invariants the gate is supposed to enforce:
         promotion from ``candidate`` only, evidence naming every queued run,
         and a stamped verdict change. ``promoted_at`` is stamped here.
         """

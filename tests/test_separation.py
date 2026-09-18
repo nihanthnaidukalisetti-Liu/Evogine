@@ -20,6 +20,7 @@ from evogine.engine.records import (
     RecordCounterfactual,
     RecordProvenance,
 )
+from evogine.gates.approvals import ApprovalLog
 from evogine.gates.materiality import Verdict
 from evogine.gates.memory_gate import MemoryGate, run_promotion_pass
 from evogine.gates.replay import ReplayRun
@@ -149,15 +150,18 @@ def test_real_gate_decisions_carry_proxy_not_verifier(tmp_path: Path):
     gate = MemoryGate(
         ScriptedRunner(),  # type: ignore[arg-type]
         DecisionLog(tmp_path),
+        approvals=ApprovalLog(tmp_path),
         evidence=RunsEvidenceSink(tmp_path),
         trajectories=TrajectoryStore(tmp_path),
     )
     decisions = run_promotion_pass(store, gate)  # type: ignore[arg-type]
 
-    assert len(decisions) == 1 and store.promoted == ["separation-probe"]
+    # V2-6: the cleared verdict renders a pending proposal — the pass
+    # promotes nothing and demotes nothing (the human boundary holds).
+    assert len(decisions) == 1 and store.promoted == [] and store.demoted == []
     decision = decisions[0]
     # The decision cleared the proxy (replay materiality) — and the
     # verifier identity appears nowhere in the shipped decision payload:
     # the two judges stay apart in artifacts, not just fixture constants.
-    assert decision.stage is DecisionStage.NEVER_WORSE
+    assert decision.stage is DecisionStage.APPROVAL
     assert EVALUATION_VERIFIER not in decision.model_dump_json()

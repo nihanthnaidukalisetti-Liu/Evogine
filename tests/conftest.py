@@ -4,9 +4,11 @@ The suite is offline by contract — no live-model calls anywhere; these
 factories are pure pydantic construction.
 """
 
+import os
 from datetime import UTC, datetime
 
 import pytest
+from hypothesis import settings
 
 from evogine.engine.records import (
     LearningRecord,
@@ -14,6 +16,15 @@ from evogine.engine.records import (
     RecordCounterfactual,
     RecordProvenance,
 )
+
+# Hypothesis profiles: the ``dev`` default keeps local runs fast; CI exports
+# ``HYPOTHESIS_PROFILE=ci`` (see .github/workflows/ci.yml) to raise the
+# example budget. Tests that pay for real processes per example (git commits,
+# fresh interpreters) pin their own lower max_examples explicitly — the
+# profile raises the in-memory suites, not the process-heavy ones.
+settings.register_profile("dev", max_examples=30, deadline=None)
+settings.register_profile("ci", max_examples=200, deadline=None)
+settings.load_profile(os.getenv("HYPOTHESIS_PROFILE", "dev"))
 
 
 def make_record(record_id: str, topic: str = "429 backoff") -> LearningRecord:

@@ -29,7 +29,8 @@ from evogine.sandbox.config import SandboxConfig
 from evogine.sandbox.sanitize import sanitize_output
 
 if TYPE_CHECKING:
-    from docker import DockerClient
+    # docker-py ships no type stubs (import-untyped); its surface stays Any.
+    from docker import DockerClient  # type: ignore[import-untyped]
 
 class SandboxError(RuntimeError):
     """The sandbox could not run the workload (infrastructure failure)."""

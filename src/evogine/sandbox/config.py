@@ -19,12 +19,14 @@ class SandboxConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     python_image: str = "python:3.12-slim"
-    # Exact pins: the evaluated tree may import pydantic/yaml and pytest must
-    # exist inside the container. Matches the versions this repo's CI validates.
+    # Exact pins: the evaluated tree may import pydantic/yaml, the suite uses
+    # pytest + hypothesis, so all must exist inside the container. Matches the
+    # versions this repo's CI validates.
     pinned_deps: tuple[str, ...] = (
         "pydantic==2.13.5",
         "pyyaml==6.0.3",
         "pytest==9.1.1",
+        "hypothesis==6.168.0",
     )
     memory_mb: int = 512
     cpus: float = 1.0

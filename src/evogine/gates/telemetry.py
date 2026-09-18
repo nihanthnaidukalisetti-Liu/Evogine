@@ -65,6 +65,15 @@ class PromotionDecision(BaseModel):
     """V2-8 anti-gaming: store-relative path to the decision's trajectory
     file (tool calls included), set when trajectory capture is wired — the
     full path to this verdict, not just the verdict."""
+    pass_id: str | None = None
+    """V3 pass identity: the promotion pass that produced this decision,
+    ``None`` for decisions made outside a pass or predating the field —
+    old decision files stay readable unchanged."""
+    review_latency_seconds: float | None = None
+    """V3 review latency: seconds from the record's ``created`` timestamp
+    to this decision's ``decided_at``, computed at review time from those
+    two existing clocks (no new instrumentation) — how long knowledge sat
+    before the gate decided it. ``None`` only when unknown (legacy files)."""
 
 
 class TelemetryError(ValueError):

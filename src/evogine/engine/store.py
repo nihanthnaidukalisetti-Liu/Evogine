@@ -103,6 +103,10 @@ class AuditEvent(BaseModel):
     to_status: str
     reason: str | None = None
     run_ids: list[str] = Field(default_factory=list)
+    pass_id: str | None = None
+    """V3 pass identity: stamped on audit events a promotion pass caused
+    (its knowledge-stage demotions), ``None`` for every other event and
+    for lines predating the field — the trail stays readable unchanged."""
 
 
 def _git(root: Path, *args: str) -> None:
@@ -306,13 +310,17 @@ class Engine:
         self._commit(f"promote: {learning_id}")
         return promoted
 
-    def demote(self, learning_id: str, reason: str) -> LearningRecord:
+    def demote(
+        self, learning_id: str, reason: str, *, pass_id: str | None = None
+    ) -> LearningRecord:
         """Move ``learning_id`` to ``dropped`` with ``reason`` recorded.
 
         Dropped records remain in the store for audit; the engine never
         silently forgets what it once believed. Allowed from any live state
         (``ephemeral``/``candidate``/``promoted``): rejections and retractions
-        alike stay visible in the store's history.
+        alike stay visible in the store's history. ``pass_id`` stamps the
+        audit event when a promotion pass caused the demotion (V3) — the
+        trail shows which pass dropped the record, not just that one did.
         """
         if not reason.strip():
             raise StoreError("demote requires a reason")
@@ -328,6 +336,7 @@ class Engine:
                 from_status=record.status,
                 to_status="dropped",
                 reason=reason,
+                pass_id=pass_id,
             )
         )
         self._commit(f"demote: {learning_id}")

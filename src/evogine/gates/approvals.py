@@ -20,6 +20,7 @@ candidate, so refused knowledge cannot be re-proposed unchanged).
 from __future__ import annotations
 
 import os
+import re
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -40,6 +41,36 @@ from evogine.gates.telemetry import (
 
 class ApprovalError(Exception):
     """An approval action violates the boundary contract: refused or misuse."""
+
+
+# Operator identity format (V3): a nonblank printable identity of at most
+# 64 characters — a handle ("nihanth"), a display name ("Nihanth Naidu
+# Kalisetti"), or an email ("nihanthnaidu008@gmail.com"). Leading and
+# trailing whitespace is stripped; control characters (notably newlines,
+# which would corrupt one-event-per-line audit greps) and quoting/bracket
+# punctuation are refused. Legacy decision files stay readable unchanged:
+# validation happens here, at the boundary, only when a new identity is
+# recorded — never on load.
+OPERATOR_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._'@+-]{0,63}$")
+
+
+def operator_identity(raw: str) -> str:
+    """Validate an operator identity for the human-approval boundary.
+
+    Returns the stripped identity; raises :class:`ApprovalError` when it
+    is blank or does not match the accepted format. Both decision paths
+    funnel ``decided_by`` through the log's ``record_*`` methods, so this
+    is the one choke point every future transport inherits.
+    """
+    identity = raw.strip()
+    if not identity:
+        raise ApprovalError("operator identity must not be blank")
+    if not OPERATOR_PATTERN.fullmatch(identity):
+        raise ApprovalError(
+            f"operator identity {identity!r} does not match the accepted format "
+            "(letters, digits, spaces, . _ ' @ + - ; up to 64 characters)"
+        )
+    return identity
 
 
 class ApprovalState(str, Enum):
@@ -160,8 +191,7 @@ class ApprovalLog:
     ) -> PromotionProposal:
         """Record a human approval: ``pending -> approved``."""
         proposal = self._require_pending(proposal_id)
-        if not decided_by.strip():
-            raise ApprovalError("approval requires a decided_by identity")
+        decided_by = operator_identity(decided_by)
         decided = proposal.model_copy(
             update={
                 "state": ApprovalState.APPROVED,
@@ -178,8 +208,7 @@ class ApprovalLog:
     ) -> PromotionProposal:
         """Record a human rejection: ``pending -> rejected`` (reason required)."""
         proposal = self._require_pending(proposal_id)
-        if not decided_by.strip():
-            raise ApprovalError("rejection requires a decided_by identity")
+        decided_by = operator_identity(decided_by)
         if not reason.strip():
             raise ApprovalError("rejection requires a reason")
         decided = proposal.model_copy(

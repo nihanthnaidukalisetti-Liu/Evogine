@@ -7,7 +7,8 @@ unproven, agent-generated knowledge out of active use until the memory gate
 proves it materially changes verdicts.
 
 Persistence model: the store root is a dedicated directory that is its own
-git repository — one JSON file per record, one commit per lifecycle
+git repository — one JSON file per record under ``records/``, an append-only
+JSONL audit trail at ``audit.jsonl``, and one commit per lifecycle
 transition. Nesting inside an enclosing repo is safe: every git command runs
 with ``cwd`` pinned to the root, so an enclosing index is never touched and
 store commits can never sweep up unrelated files.
@@ -20,6 +21,9 @@ import re
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
+
+from pydantic import BaseModel, Field
 
 from evogine.engine.records import LearningRecord, RecordCounterfactual
 
@@ -37,6 +41,19 @@ class StoreError(Exception):
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+class AuditEvent(BaseModel):
+    """One immutable lifecycle entry in the append-only audit trail."""
+
+    seq: int = 0
+    ts: datetime = Field(default_factory=_now)
+    event: Literal["propose", "queue_replay", "promote", "demote"]
+    record_id: str
+    from_status: str | None = None
+    to_status: str
+    reason: str | None = None
+    run_ids: list[str] = Field(default_factory=list)
 
 
 def _git(root: Path, *args: str) -> None:
@@ -112,6 +129,7 @@ class Engine:
     def __init__(self, root: Path | str) -> None:
         self.root = Path(root)
         self.records_dir = self.root / "records"
+        self.audit_path = self.root / "audit.jsonl"
         self.records_dir.mkdir(parents=True, exist_ok=True)
         if not (self.root / ".git").exists():
             _git(self.root, "init", "-q")
@@ -175,6 +193,7 @@ class Engine:
             raise StoreError(f"record already exists: {draft.id}")
         record = draft.model_copy(update={"status": "ephemeral"})
         self._save(record)
+        self._append_audit(AuditEvent(event="propose", record_id=record.id, to_status="ephemeral"))
         self._commit(f"propose: {record.id}")
         return record
 
@@ -200,6 +219,15 @@ class Engine:
             }
         )
         self._save(queued)
+        self._append_audit(
+            AuditEvent(
+                event="queue_replay",
+                record_id=learning_id,
+                from_status="ephemeral",
+                to_status="candidate",
+                run_ids=list(run_ids),
+            )
+        )
         self._commit(f"queue_replay: {learning_id} ({len(run_ids)} runs)")
 
     def promote(self, learning_id: str, replay_evidence: RecordCounterfactual) -> LearningRecord:
@@ -234,6 +262,15 @@ class Engine:
             }
         )
         self._save(promoted)
+        self._append_audit(
+            AuditEvent(
+                event="promote",
+                record_id=learning_id,
+                from_status="candidate",
+                to_status="promoted",
+                run_ids=list(evidence.replay_run_ids),
+            )
+        )
         self._commit(f"promote: {learning_id}")
         return promoted
 
@@ -252,6 +289,15 @@ class Engine:
             raise StoreError(f"record already dropped: {learning_id}")
         dropped = record.model_copy(update={"status": "dropped"})
         self._save(dropped)
+        self._append_audit(
+            AuditEvent(
+                event="demote",
+                record_id=learning_id,
+                from_status=record.status,
+                to_status="dropped",
+                reason=reason,
+            )
+        )
         self._commit(f"demote: {learning_id}")
         return dropped
 
@@ -272,6 +318,21 @@ class Engine:
         tmp = path.with_suffix(".json.tmp")
         tmp.write_text(record.model_dump_json(indent=2) + "\n", encoding="utf-8")
         os.replace(tmp, path)
+
+    def _append_audit(self, event: AuditEvent) -> None:
+        """Append one event as a new JSONL line.
+
+        The audit trail is only ever appended to, never rewritten; ``seq``
+        is derived from the live line count so the file itself stays the
+        single source of truth, even across engine restarts.
+        """
+        seq = 0
+        if self.audit_path.exists():
+            with self.audit_path.open("r", encoding="utf-8") as fh:
+                seq = sum(1 for line in fh if line.strip())
+        stamped = event.model_copy(update={"seq": seq + 1, "ts": _now()})
+        with self.audit_path.open("a", encoding="utf-8") as fh:
+            fh.write(stamped.model_dump_json() + "\n")
 
     def _all_records(self) -> list[LearningRecord]:
         return [

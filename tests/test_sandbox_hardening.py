@@ -228,6 +228,22 @@ def test_ensure_image_builds_from_bytesio_context() -> None:
         assert packed is not None and packed.read() == fileobj.getvalue()
 
 
+def test_image_tag_is_a_digest_of_the_full_recipe() -> None:
+    """Any provisioning change must rehash the tag.
+
+    The tag hashes the rendered dockerfile, not just its inputs — a recipe
+    change without a dep-list change (e.g. a new apt package) would otherwise
+    match the cached tag and silently reuse an image built from a different
+    recipe (caught by the CI docker-gated job).
+    """
+    import hashlib
+
+    client = FakeClient()
+    sandbox = DockerSandbox(client=client)
+    digest = hashlib.sha256(sandbox._config.dockerfile.encode()).hexdigest()[:12]
+    assert sandbox._config.image_tag == f"evogine-gate:py312-{digest}"
+
+
 def test_ensure_image_build_failure_raises_sandbox_error() -> None:
     client = FakeClient()
     client.images.build_fails = True

@@ -49,13 +49,29 @@ class SandboxConfig(BaseModel):
 
     @property
     def image_tag(self) -> str:
-        """Content-addressed tag: a config change rebuilds, a match reuses."""
-        payload = self.python_image + "|" + " ".join(self.pinned_deps)
-        digest = hashlib.sha256(payload.encode()).hexdigest()[:12]
+        """Content-addressed tag over the FULL rendered recipe.
+
+        Hashing the rendered dockerfile (not just its inputs) means any
+        provisioning change — a new pin, a new apt package — rehashes the tag
+        and forces a rebuild; a matching tag can never silently reuse an image
+        built from a different recipe.
+        """
+        digest = hashlib.sha256(self.dockerfile.encode()).hexdigest()[:12]
         return f"evogine-gate:py312-{digest}"
 
     @property
     def dockerfile(self) -> str:
-        """The minimal, pinned provisioning recipe (built once, then cached)."""
+        """The minimal, pinned provisioning recipe (built once, then cached).
+
+        The pytest stage runs the full candidate suite inside this image, and
+        the suite exercises the git-backed learning store directly — git is a
+        hard runtime requirement of the candidate suite itself, so the image
+        installs it via apt before the pip layer.
+        """
         deps = " ".join(self.pinned_deps)
-        return f"FROM {self.python_image}\nRUN pip install --no-cache-dir {deps}\n"
+        return (
+            f"FROM {self.python_image}\n"
+            "RUN apt-get update && apt-get install -y --no-install-recommends git"
+            " && rm -rf /var/lib/apt/lists/*\n"
+            f"RUN pip install --no-cache-dir {deps}\n"
+        )

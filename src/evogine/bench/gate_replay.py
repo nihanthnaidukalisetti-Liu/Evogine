@@ -83,14 +83,11 @@ class HarnessReplayRunner:
             if arm == BASELINE_ARM:
                 retriever = self._engine
             else:
-<<<<<<< HEAD
                 retriever = OverlayRetriever(
                     pool=self._engine.promoted_records(),
                     overlay=[record],
                     embedder=self._engine.embedder,
                 )
-=======
-                retriever = _OverlayRetriever(self._engine, record)
             gate_arm: Arm = "baseline" if arm == BASELINE_ARM else "warm"
             run_dir: RunDirectory | None = None
             artifacts: RunArtifacts | None = None
@@ -100,7 +97,6 @@ class HarnessReplayRunner:
                 # so deterministic ids would collide across invocations.
                 run_dir = open_run(self._runs_root)
                 artifacts = RunArtifacts(run_dir)
->>>>>>> 0c07814 (feat(bench): RunArtifacts persistence for CLI runs)
             report = BenchHarness(retriever, self._runner).run(
                 corpus=self._corpus, repeats=self._repeats, artifacts=artifacts
             )

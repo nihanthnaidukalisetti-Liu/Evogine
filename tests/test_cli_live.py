@@ -449,6 +449,12 @@ def test_live_resume_reuses_persisted_outcomes_without_re_spending(
         )
     )
     assert outcome["output"] == "pre-existing"
+    # The spend report reconciles from disk: 79 persisted call records
+    # (the reused outcome's original call happened before the crash).
+    spend = json.loads(
+        (run.directory / "artifacts" / "spend-report.json").read_text(encoding="utf-8")
+    )
+    assert spend["recorded_calls"] == 79
 
 
 def test_resuming_a_completed_run_is_refused(
@@ -468,3 +474,44 @@ def test_resuming_a_completed_run_is_refused(
     assert cli.main([*_bench_live_argv(root, protocol), "--run-id", run_id]) == 1
     assert "immutable" in capsys.readouterr().err
     assert len(seam.client.requests) == calls_before  # no re-spend on refusal
+
+
+def test_live_run_reconciles_spend_from_persisted_records(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The post-run spend report prices the persisted call records, not memory."""
+    root = tmp_path / "store"
+    protocol = _protocol_yaml(tmp_path)  # repeats 4
+    _patch_live_seams(monkeypatch, with_key=True)
+
+    assert cli.main([*_bench_live_argv(root, protocol), "--format", "json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    # The fake client's fixed tokens — 1000 in / 500 out at $3.00/$15.00 per
+    # Mtok — price one call at $0.0105; 80 calls reconcile to $0.8400 against
+    # the default $25.00 ceiling.
+    assert payload["spend"]["recorded_calls"] == 80
+    assert payload["spend"]["calls_with_usage"] == 80
+    assert payload["spend"]["calls_without_usage"] == 0
+    assert payload["spend"]["actual_cost_usd"] == "0.8400"
+    assert payload["spend"]["within_ceiling"] is True
+
+    run_dir = Path(payload["run_dir"])
+    persisted = json.loads(
+        (run_dir / "artifacts" / "spend-report.json").read_text(encoding="utf-8")
+    )
+    assert persisted["recorded_calls"] == 80
+    assert persisted["within_ceiling"] is True
+
+
+def test_offline_bench_writes_no_spend_report(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An offline run has no dollar ceiling to reconcile — no spend report."""
+    root = tmp_path / "store"
+
+    assert cli.main(["bench", "--root", str(root), "--format", "json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload.get("spend") is None
+    assert not (Path(payload["run_dir"]) / "artifacts" / "spend-report.json").exists()

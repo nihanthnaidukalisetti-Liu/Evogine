@@ -51,7 +51,13 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from evogine import __version__
-from evogine.bench.budgets import DollarBudget, SpendCeilingExceededError, queue_spend
+from evogine.bench.budgets import (
+    DollarBudget,
+    SpendCeilingExceededError,
+    SpendReconciliation,
+    queue_spend,
+    reconcile_spend,
+)
 from evogine.bench.cases import BenchCase, default_corpus
 from evogine.bench.gate_replay import HarnessReplayRunner
 from evogine.bench.harness import (
@@ -61,7 +67,7 @@ from evogine.bench.harness import (
     RunArtifacts,
     refuse_contaminated_holdout,
 )
-from evogine.bench.live import LiveCaseRunner
+from evogine.bench.live import LiveCaseRunner, read_call_records
 from evogine.bench.probes import ContaminationError
 from evogine.bench.prompts import DEFAULT_PROMPT_PACK
 from evogine.bench.protocol import (
@@ -447,6 +453,7 @@ def _bench(
             return _refuse(f"protocol {protocol_path} refused: {exc}")
 
     engine = Engine(root)
+    budget: DollarBudget | None = None
     if runner_name == "live":
         api_key = _resolve_provider_key()
         if api_key is None:
@@ -509,6 +516,13 @@ def _bench(
             protocol=protocol,
             artifacts=RunArtifacts(run_dir),
         )
+        reconciliation: SpendReconciliation | None = None
+        if live_client is not None and budget is not None:
+            # Reconciled from the persisted per-call records — not the
+            # runner's memory — so a resumed run's report also accounts
+            # for every call loaded back from disk.
+            reconciliation = reconcile_spend(budget, read_call_records(run_dir))
+            run_dir.write_artifact("spend-report", reconciliation.model_dump_json(indent=2))
         run_dir.mark_complete()
     except (StoreError, ValueError, ProtocolValidationError, ContaminationError) as exc:
         return _refuse(str(exc))
@@ -532,6 +546,8 @@ def _bench(
                 for case_report in report.cases
             ],
         }
+        if reconciliation is not None:
+            payload["spend"] = reconciliation.model_dump(mode="json")
         print(json.dumps(payload, indent=2))
         return 0
     runner_label = "live" if live_client is not None else "offline"
@@ -540,6 +556,13 @@ def _bench(
         f"{summary.replays} replays at {summary.repeats} repeats"
     )
     print(f"  run dir: {run_dir.directory}")
+    if reconciliation is not None:
+        print(
+            f"  spend: ${reconciliation.actual_cost_usd} of "
+            f"${reconciliation.ceiling_usd} ceiling over "
+            f"{reconciliation.recorded_calls} calls "
+            f"({reconciliation.calls_without_usage} without usage)"
+        )
     print(f"  cold pass rate: {summary.cold_pass_rate:.3f}")
     print(f"  warm pass rate: {summary.warm_pass_rate:.3f}")
     print(f"  mean delta:     {summary.mean_delta_pass_rate:+.3f}")

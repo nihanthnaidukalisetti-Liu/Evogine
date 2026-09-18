@@ -24,6 +24,12 @@ from pydantic import BaseModel, ConfigDict
 
 from evogine.bench.budgets import BenchPlan, queue_replays
 from evogine.bench.cases import BenchCase, default_corpus
+from evogine.bench.protocol import (
+    EvalProtocol,
+    ProtocolCheck,
+    ProtocolValidationError,
+    pre_run_validate,
+)
 from evogine.bench.replay import REPEAT_FLOOR, Arm, build_replay_requests
 from evogine.engine.records import LearningRecord
 
@@ -137,6 +143,7 @@ class BenchHarness:
         repeats: int | None = None,
         corpus: Sequence[BenchCase] | None = None,
         plan: BenchPlan | None = None,
+        protocol: EvalProtocol | None = None,
     ) -> BenchReport:
         """Run ``case_ids`` (default: the full 10-case corpus) cold and warm.
 
@@ -144,11 +151,26 @@ class BenchHarness:
         checked plan; a repeat count below the 4-repeat floor is refused.
         When ``plan`` declares replay budgets, an exceeding schedule is
         refused at queue time — before the first replay is spent.
+
+        When ``protocol`` is given (V2-7), the run is pre-registered: the
+        protocol is validated against the corpus before anything is spent,
+        and explicit arguments that contradict it are refused rather than
+        silently overriding it.
         """
-        cases, effective_repeats = _resolve_inputs(case_ids, repeats, corpus, plan)
-        requests = build_replay_requests(cases, effective_repeats)
-        if plan is not None:
-            queue_replays(requests, plan.budgets)  # V2-4: refuse before spend
+        if protocol is not None:
+            if plan is not None:
+                raise ValueError(
+                    "plan conflicts: the protocol already pins the harness config — "
+                    "pass protocol or plan, not both"
+                )
+            check = _validate_protocol_pre_run(protocol, corpus, case_ids, repeats)
+            cases = list(check.cases)
+            effective_repeats = protocol.repeats
+        else:
+            cases, effective_repeats = _resolve_inputs(case_ids, repeats, corpus, plan)
+            requests = build_replay_requests(cases, effective_repeats)
+            if plan is not None:
+                queue_replays(requests, plan.budgets)  # V2-4: refuse before spend
         case_reports: list[CaseReport] = []
         for case in cases:
             cold_knowledge: list[LearningRecord] = []
@@ -181,6 +203,31 @@ class BenchHarness:
             output=output,
             knowledge_ids=[record.id for record in knowledge],
         )
+
+
+def _validate_protocol_pre_run(
+    protocol: EvalProtocol,
+    corpus: Sequence[BenchCase] | None,
+    case_ids: Sequence[str] | None,
+    repeats: int | None,
+) -> ProtocolCheck:
+    """Run the V2-7 pre-registration gate: nothing is spent until it passes.
+
+    The protocol is the first-class source of run config (mirroring the
+    V2-4 plan semantics): explicit arguments that contradict it are refused
+    rather than silently overriding it.
+    """
+    pool = list(corpus) if corpus is not None else default_corpus()
+    check = pre_run_validate(protocol, pool)
+    if case_ids is not None and set(case_ids) != {case.id for case in check.cases}:
+        raise ProtocolValidationError(
+            ["case_ids conflict: the explicit argument contradicts the protocol"]
+        )
+    if repeats is not None and repeats != protocol.repeats:
+        raise ProtocolValidationError(
+            ["repeats conflict: the explicit argument contradicts the protocol"]
+        )
+    return check
 
 
 def _resolve_inputs(

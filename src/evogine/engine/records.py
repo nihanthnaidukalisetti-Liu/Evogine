@@ -10,6 +10,7 @@ phases can audit *why* the engine believes something.
 
 from __future__ import annotations
 
+import math
 from datetime import UTC, datetime
 from typing import Literal
 
@@ -94,8 +95,8 @@ def decayed_confidence(
     if now <= since:
         return confidence
     age_days = (now - since).total_seconds() / 86400
-    decayed = config.floor + (confidence - config.floor) * 2.0 ** (
-        -age_days / config.half_life_days
+    decayed = config.floor + (confidence - config.floor) * math.pow(
+        2.0, -age_days / config.half_life_days
     )
     return min(confidence, decayed)
 

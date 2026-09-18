@@ -9,14 +9,29 @@ promotion proposals into the store's approval log, and
 ``approvals list|approve|reject`` is how a person reviews and decides
 them — approve applies the promotion, reject refuses it and demotes the
 record. The gate never promotes on its own.
+
+``run`` drives a full promotion pass over a store root: it wires the memory
+gate to the bench-backed replay runner (HarnessReplayRunner) with the
+offline KnowledgeRunner, decides every candidate learning, records one
+telemetry decision per proposal, and renders approval proposals — exiting
+non-zero when any gate-error decision was made. ``bench`` runs the
+warm-vs-cold harness over the default corpus with the same offline runner
+and reports pass rates; it is informational and always exits zero when the
+run completes. Both operate on an explicit ``--root``: they create or read
+a store, and silently defaulting to the working directory could benchmark
+or mutate the wrong store (git-safety).
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 
 from evogine import __version__
+from evogine.bench.gate_replay import HarnessReplayRunner
+from evogine.bench.harness import REPEAT_FLOOR, BenchHarness
+from evogine.bench.runner import KnowledgeRunner
 from evogine.engine.store import Engine, StoreError
 from evogine.gates.approvals import (
     ApprovalError,
@@ -25,7 +40,8 @@ from evogine.gates.approvals import (
     approve_proposal,
     reject_proposal,
 )
-from evogine.gates.telemetry import DecisionLog, DecisionStage
+from evogine.gates.memory_gate import MemoryGate, run_promotion_pass
+from evogine.gates.telemetry import DecisionLog, DecisionStage, RunsEvidenceSink
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -34,17 +50,35 @@ def main(argv: list[str] | None = None) -> int:
         prog="evogine",
         description="Self-evolving agentic engine.",
     )
-    parser.add_argument(
-        "--version", action="version", version=f"evogine {__version__}"
-    )
+    parser.add_argument("--version", action="version", version=f"evogine {__version__}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    decisions_parser = subparsers.add_parser(
-        "decisions", help="promotion telemetry"
+    run_parser = subparsers.add_parser(
+        "run",
+        help="promotion pass: decide candidate learnings (replay, materiality, approval)",
     )
-    decisions_subparsers = decisions_parser.add_subparsers(
-        dest="decisions_command", required=True
+    run_parser.add_argument("--root", required=True, help="engine store root to operate on")
+    run_parser.add_argument(
+        "--repeats",
+        type=int,
+        default=8,
+        help=f"repetitions per replay arm (floor: {REPEAT_FLOOR}; default: 8)",
     )
+
+    bench_parser = subparsers.add_parser(
+        "bench", help="warm-vs-cold benchmark over the default corpus"
+    )
+    bench_parser.add_argument("--root", required=True, help="engine store root to benchmark")
+    bench_parser.add_argument(
+        "--repeats",
+        type=int,
+        default=8,
+        help=f"repetitions per arm (floor: {REPEAT_FLOOR}; default: 8)",
+    )
+    bench_parser.add_argument("--format", choices=["table", "json"], default="table", dest="format")
+
+    decisions_parser = subparsers.add_parser("decisions", help="promotion telemetry")
+    decisions_subparsers = decisions_parser.add_subparsers(dest="decisions_command", required=True)
     report_parser = decisions_subparsers.add_parser(
         "report", help="counts of promotion decisions by stage"
     )
@@ -57,9 +91,7 @@ def main(argv: list[str] | None = None) -> int:
     approvals_parser = subparsers.add_parser(
         "approvals", help="human-approval promotion boundary (V2-6)"
     )
-    approvals_subparsers = approvals_parser.add_subparsers(
-        dest="approvals_command", required=True
-    )
+    approvals_subparsers = approvals_parser.add_subparsers(dest="approvals_command", required=True)
     approvals_list_parser = approvals_subparsers.add_parser(
         "list", help="promotion proposals rendered by the memory gate"
     )
@@ -96,6 +128,10 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     args = parser.parse_args(argv)
+    if args.command == "run":
+        return _run(args.root, repeats=args.repeats)
+    if args.command == "bench":
+        return _bench(args.root, repeats=args.repeats, as_json=args.format == "json")
     if args.command == "decisions" and args.decisions_command == "report":
         return _decisions_report(args.root)
     if args.command == "approvals" and args.approvals_command == "list":
@@ -109,6 +145,86 @@ def main(argv: list[str] | None = None) -> int:
             args.root, args.proposal_id, decided_by=args.by, reason=args.reason, reject=True
         )
     return 0  # unreachable: subcommands are required
+
+
+def _run(root: str, *, repeats: int) -> int:
+    """Drive a full promotion pass; exit 2 on any gate-error decision."""
+    engine = Engine(root)
+    gate = MemoryGate(
+        runner=HarnessReplayRunner(engine, KnowledgeRunner(), corpus=None, repeats=repeats),
+        log=DecisionLog(root),
+        approvals=ApprovalLog(root),
+        evidence=RunsEvidenceSink(root),
+    )
+    try:
+        decisions = run_promotion_pass(engine, gate)
+    except (StoreError, ValueError) as exc:
+        # ValueError: a repeats count below the harness's replay floor.
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"promotion pass: {len(decisions)} candidate(s) decided")
+    for decision in decisions:
+        print(f"  {decision.learning_id} [{decision.stage.value}] {decision.reason}")
+        if decision.evidence_ref:
+            print(f"    evidence: {decision.evidence_ref}")
+    gate_errors = [decision for decision in decisions if decision.stage is DecisionStage.GATE_ERROR]
+    if gate_errors:
+        print(
+            f"error: {len(gate_errors)} gate-error decision(s) — the replay "
+            "infrastructure failed; records remain candidates",
+            file=sys.stderr,
+        )
+        return 2
+    pending = ApprovalLog(root).pending()
+    if pending:
+        print(
+            f"next: {len(pending)} proposal(s) await human approval "
+            f"(evogine approvals list --root {root})"
+        )
+    return 0
+
+
+def _bench(root: str, *, repeats: int, as_json: bool) -> int:
+    """Run the warm-vs-cold harness over the default corpus; informational."""
+    engine = Engine(root)
+    try:
+        report = BenchHarness(engine, KnowledgeRunner()).run(repeats=repeats)
+    except (StoreError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    summary = report.summary
+    if as_json:
+        payload = {
+            "repeats": summary.repeats,
+            "replays": summary.replays,
+            "cold_pass_rate": summary.cold_pass_rate,
+            "warm_pass_rate": summary.warm_pass_rate,
+            "mean_delta_pass_rate": summary.mean_delta_pass_rate,
+            "cases": [
+                {
+                    "id": case_report.case_id,
+                    "cold_pass_rate": case_report.cold.pass_rate,
+                    "warm_pass_rate": case_report.warm.pass_rate,
+                    "delta_pass_rate": case_report.delta_pass_rate,
+                }
+                for case_report in report.cases
+            ],
+        }
+        print(json.dumps(payload, indent=2))
+        return 0
+    print(
+        f"bench: {len(report.cases)} cases, {summary.replays} replays at {summary.repeats} repeats"
+    )
+    print(f"  cold pass rate: {summary.cold_pass_rate:.3f}")
+    print(f"  warm pass rate: {summary.warm_pass_rate:.3f}")
+    print(f"  mean delta:     {summary.mean_delta_pass_rate:+.3f}")
+    for case_report in report.cases:
+        print(
+            f"  {case_report.case_id}: cold {case_report.cold.pass_rate:.3f} "
+            f"-> warm {case_report.warm.pass_rate:.3f} "
+            f"({case_report.delta_pass_rate:+.3f})"
+        )
+    return 0
 
 
 def _decisions_report(root: str) -> int:
@@ -136,9 +252,7 @@ def _approvals_list(root: str) -> int:
         trail = proposal.decision.reason
         print(f"    trail: {trail} (evidence: {proposal.evidence_ref or 'none'})")
         if proposal.decided_by is not None:
-            decided_reason = (
-                f": {proposal.decided_reason}" if proposal.decided_reason else ""
-            )
+            decided_reason = f": {proposal.decided_reason}" if proposal.decided_reason else ""
             print(f"    decided by {proposal.decided_by}{decided_reason}")
     return 0
 

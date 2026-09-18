@@ -248,7 +248,15 @@ class MemoryGate:
             regressions = [b.instance_id for b, w in pairs if b.passed and not w.passed]
         else:
             has_flip = any(w.score != b.score for b, w in pairs)
-            regressions = [b.instance_id for b, w in pairs if w.score < b.score]
+            # is_material has already refused arms that are not fully scored
+            # (paired_median_delta raises on a missing score), so the guards
+            # below are unreachable in a live gate — they keep the comparison
+            # honest under the type system instead of asserting it away.
+            regressions = [
+                b.instance_id
+                for b, w in pairs
+                if b.score is not None and w.score is not None and w.score < b.score
+            ]
 
         # Stage 1 — REPLAY: did the warm verdict actually flip?
         if not has_flip:

@@ -34,7 +34,8 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from evogine.gates.code_gate import CaseEvaluator, CaseResult, CaseVerdict, EvalCase
+from evogine.gates.code_gate import CaseEvaluator, EvalCase
+from evogine.gates.equivalence import CaseResult, CaseVerdict
 from evogine.sandbox.sanitize import sanitize_output
 
 

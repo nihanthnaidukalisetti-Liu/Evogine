@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from evogine.engine.records import LearningRecord, RecordCounterfactual
+from evogine.gates.telemetry import DecisionStage, PromotionDecision
 from evogine.swarm.clients import ModelRequest, ModelResponse
 from evogine.swarm.roles import (
     Builder,
@@ -85,9 +86,17 @@ class SpyMemoryGate:
         self.verdict = verdict
         self.calls: list[tuple[LearningRecord, list[str]]] = []
 
-    def review(self, record: LearningRecord, replay_run_ids: list[str]) -> bool:
+    def review(
+        self, record: LearningRecord, replay_run_ids: list[str]
+    ) -> PromotionDecision:
         self.calls.append((record, replay_run_ids))
-        return self.verdict
+        return PromotionDecision(
+            proposal_id=record.id,
+            learning_id=record.id,
+            promoted=self.verdict,
+            stage=DecisionStage.NEVER_WORSE if self.verdict else DecisionStage.REPLAY,
+            reason="cleared: test" if self.verdict else "no_flip: test",
+        )
 
 
 def _promoted(record_id: str) -> LearningRecord:
@@ -172,7 +181,10 @@ def test_verifier_reviews_learning_through_the_memory_gate() -> None:
     verifier = Verifier(code_gate=SpyCodeGate(False), memory_gate=memory)
     record = LearningRecord.sample()
 
-    assert verifier.review_learning(record, ["run-1"]) is True
+    decision = verifier.review_learning(record, ["run-1"])
+
+    assert decision.learning_id == record.id
+    assert decision.promoted is True
     assert memory.calls == [(record, ["run-1"])]
 
 

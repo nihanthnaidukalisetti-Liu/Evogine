@@ -17,7 +17,12 @@ telemetry decision per proposal, and renders approval proposals — exiting
 non-zero when any gate-error decision was made. ``bench`` runs the
 warm-vs-cold harness over the default corpus with the same offline runner
 and reports pass rates; it is informational and always exits zero when the
-run completes. Both operate on an explicit ``--root``: they create or read
+run completes. ``shadow`` (V3 W2) profiles a candidate retrieval
+configuration over that corpus without touching lifecycle state: the store
+is handed over through a read-only seam, results land only under
+``runs/shadow/<candidate_id>/``, and a contaminated or over-ceiling run is
+refused before anything is evaluated — exiting non-zero with $0 spent.
+Both operate on an explicit ``--root``: they create or read
 a store, and silently defaulting to the working directory could benchmark
 or mutate the wrong store (git-safety).
 """
@@ -27,11 +32,15 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 
 from evogine import __version__
+from evogine.bench.cases import BenchCase, default_corpus
 from evogine.bench.gate_replay import HarnessReplayRunner
 from evogine.bench.harness import REPEAT_FLOOR, BenchHarness
+from evogine.bench.rundirs import RunCompleteError
 from evogine.bench.runner import KnowledgeRunner
+from evogine.bench.shadow import ShadowRefusalError, load_shadow_candidate, run_shadow_pass
 from evogine.engine.store import Engine, StoreError
 from evogine.gates.approvals import (
     ApprovalError,
@@ -76,6 +85,26 @@ def main(argv: list[str] | None = None) -> int:
         help=f"repetitions per arm (floor: {REPEAT_FLOOR}; default: 8)",
     )
     bench_parser.add_argument("--format", choices=["table", "json"], default="table", dest="format")
+
+    shadow_parser = subparsers.add_parser(
+        "shadow",
+        help="shadow-pass profiling of a candidate config — never mutates the store (V3 W2)",
+    )
+    shadow_parser.add_argument("--root", required=True, help="engine store root to profile against (read-only)")
+    shadow_parser.add_argument(
+        "--candidate", required=True, help="path to the shadow candidate declaration (YAML)"
+    )
+    shadow_parser.add_argument(
+        "--runs-root",
+        default=None,
+        help="shadow runs root (default: <root>/runs/shadow)",
+    )
+    shadow_parser.add_argument(
+        "--repeats",
+        type=int,
+        default=8,
+        help=f"repetitions per arm (floor: {REPEAT_FLOOR}; default: 8)",
+    )
 
     decisions_parser = subparsers.add_parser("decisions", help="promotion telemetry")
     decisions_subparsers = decisions_parser.add_subparsers(dest="decisions_command", required=True)
@@ -132,6 +161,13 @@ def main(argv: list[str] | None = None) -> int:
         return _run(args.root, repeats=args.repeats)
     if args.command == "bench":
         return _bench(args.root, repeats=args.repeats, as_json=args.format == "json")
+    if args.command == "shadow":
+        return _shadow(
+            args.root,
+            candidate_path=args.candidate,
+            runs_root=args.runs_root,
+            repeats=args.repeats,
+        )
     if args.command == "decisions" and args.decisions_command == "report":
         return _decisions_report(args.root)
     if args.command == "approvals" and args.approvals_command == "list":
@@ -225,6 +261,58 @@ def _bench(root: str, *, repeats: int, as_json: bool) -> int:
             f"({case_report.delta_pass_rate:+.3f})"
         )
     return 0
+
+
+def _shadow(root: str, *, candidate_path: str, runs_root: str | None, repeats: int) -> int:
+    """Profile a shadow candidate; the store is read-only, the run dir the only sink."""
+    try:
+        candidate = load_shadow_candidate(candidate_path)
+        report = run_shadow_pass(
+            Engine(root),  # handed over as the read-only ShadowStore seam only
+            candidate,
+            KnowledgeRunner(),
+            runs_root=(
+                Path(runs_root) if runs_root is not None else Path(root) / "runs" / "shadow"
+            ),
+            heldout_cases=_resolve_holdout_family(candidate.heldout_family),
+            repeats=repeats,
+        )
+    except ShadowRefusalError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except (RunCompleteError, StoreError, ValueError) as exc:
+        # RunCompleteError: a completed shadow run is immutable evidence —
+        # rerunning it means declaring a new candidate id.
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    summary = report.summary
+    print(
+        f"shadow {report.candidate_id}: {summary.replays} replays at {summary.repeats} repeats"
+        f" (projected ${report.projected_cost_usd} of ${report.ceiling_usd})"
+    )
+    print(f"  cold pass rate: {summary.cold_pass_rate:.3f}")
+    print(f"  warm pass rate: {summary.warm_pass_rate:.3f}")
+    print(f"  mean delta:     {summary.mean_delta_pass_rate:+.3f}")
+    print(
+        f"  heldout recall probe: clean ({report.contamination.probed_cases} case(s) probed)"
+    )
+    print(f"  run: {report.run_ref} (complete — immutable)")
+    return 0
+
+
+def _resolve_holdout_family(family: str | None) -> list[BenchCase]:
+    """Resolve the declared held-out family against the default corpus.
+
+    An undeclared family means no holdout — the recall probe runs and
+    reports zero cases. A declared family that matches nothing is config
+    drift: refuse rather than silently probe nothing.
+    """
+    if family is None:
+        return []
+    cases = [case for case in default_corpus() if case.family == family]
+    if not cases:
+        raise ValueError(f"heldout family {family!r} matches no case in the corpus")
+    return cases
 
 
 def _decisions_report(root: str) -> int:

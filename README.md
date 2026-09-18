@@ -30,7 +30,8 @@ src/evogine/
 ├── bench/
 │   ├── harness.py     # warm-vs-cold decay-pressure benchmark
 │   ├── cases/         # the 10-case corpus with hidden host-side invariants
-│   └── replay.py      # replay schedule vocabulary (case × arm × repeat)
+│   ├── replay.py      # replay schedule vocabulary (case × arm × repeat)
+│   └── shadow.py      # W2 shadow pass: profile candidates without mutating state
 ├── seeds/             # bootstrap learning records (empty for now)
 └── py.typed
 ```

@@ -60,6 +60,15 @@ def _run_git(args: list[str], *, cwd: Path | None = None) -> bytes:
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "GIT_CONFIG_GLOBAL": "/dev/null",
         "GIT_CONFIG_SYSTEM": "/dev/null",
+        # Config files are nulled above, so the env-config channel is the only
+        # way to reach git's config. The gate stages trees as repos on the
+        # host, then the container (uid nobody) runs git inside them; git's
+        # ownership refusal would otherwise reject every such call. All git
+        # invocations here target repos WE staged or the caller's own checkout,
+        # so the ownership check protects nothing in this path.
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "safe.directory",
+        "GIT_CONFIG_VALUE_0": "*",
         "LC_ALL": "C",
     }
     try:

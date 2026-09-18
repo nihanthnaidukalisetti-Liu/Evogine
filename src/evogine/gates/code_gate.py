@@ -160,7 +160,7 @@ class DockerCaseEvaluator:
         detail = f"exit {result.exit_code}" + (" (timed out)" if result.timed_out else "")
         tail = result.stderr or result.stdout
         if tail:
-            detail += f"; output tail: {tail[-2000:]}"
+            detail += f"; output tail: {tail[-20000:]}"
         return CaseResult(
             case_id=case.case_id,
             verdict=CaseVerdict.FAIL,

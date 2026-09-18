@@ -18,7 +18,7 @@ are refused before the first replay is spent — never reconciled after.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -102,6 +102,7 @@ class Retriever(Protocol):
         ...
 
 
+@runtime_checkable
 class CaseRunner(Protocol):
     """The spend seam: produces a submission for a case in one arm/repeat.
 

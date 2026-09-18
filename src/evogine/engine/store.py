@@ -144,6 +144,15 @@ class Engine:
         """
         return self._load(learning_id)
 
+    def candidates(self) -> list[LearningRecord]:
+        """Return every record queued for replay (status ``candidate``).
+
+        Read-only view for the promotion pass: the memory gate reviews
+        exactly these and nothing else. Ordered by record id (records/
+        glob order) so a pass is deterministic.
+        """
+        return [record for record in self._all_records() if record.status == "candidate"]
+
     # ------------------------------------------------------------ lifecycle
 
     def propose(self, draft: LearningRecord) -> LearningRecord:

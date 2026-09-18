@@ -25,12 +25,23 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from evogine.engine.records import LearningRecord, RecordCounterfactual
+from evogine.engine.records import (
+    DecayConfig,
+    LearningRecord,
+    MergedSource,
+    RecordCounterfactual,
+    decayed_confidence,
+)
 
 # Ids become filenames under ``records/``: lock them to filesystem- and
 # git-safe characters so a malicious proposal can never traverse paths
 # (the security review's staging-traversal lesson, applied at the boundary).
 _ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+# States that participate in the live lifecycle. ``dropped`` is a terminal
+# rejection, ``merged`` a terminal absorption — neither merges, decays, nor
+# retires further; their records stay readable for audit either way.
+_LIVE_STATUSES = ("ephemeral", "candidate", "promoted")
 
 _WORD_RE = re.compile(r"[a-z0-9]+")
 
@@ -48,7 +59,9 @@ class AuditEvent(BaseModel):
 
     seq: int = 0
     ts: datetime = Field(default_factory=_now)
-    event: Literal["propose", "queue_replay", "promote", "demote"]
+    event: Literal[
+        "propose", "queue_replay", "promote", "demote", "merge", "decay", "retire", "reinstate"
+    ]
     record_id: str
     from_status: str | None = None
     to_status: str
@@ -300,6 +313,213 @@ class Engine:
         )
         self._commit(f"demote: {learning_id}")
         return dropped
+
+    # ------------------------------------------------------- v2: merge
+
+    def find_duplicates(self) -> list[tuple[str, str]]:
+        """Return pairs of live records that are exact duplicates.
+
+        Deliberately deterministic record-level detection: two records are
+        duplicates when they share a ``type`` and all four :class:`RecordBody`
+        fields are identical. Title-only differences still merge — the body
+        carries the knowledge, the title is presentation. Paraphrase-level
+        detection belongs to the retrieval layer (V2-3), not to a
+        guess-prone heuristic here. Pairs come back ordered by id.
+        """
+        live = [r for r in self._all_records() if r.status in _LIVE_STATUSES]
+        duplicates: list[tuple[str, str]] = []
+        for i, first in enumerate(live):
+            for second in live[i + 1 :]:
+                if first.type == second.type and first.body == second.body:
+                    duplicates.append((first.id, second.id))
+        return duplicates
+
+    def merge(self, primary_id: str, duplicate_id: str, reason: str) -> LearningRecord:
+        """Consolidate ``duplicate_id`` into ``primary_id`` (exact duplicates).
+
+        Record-level consolidation: the survivor keeps its own body and
+        provenance verbatim — nothing is summarized or rewritten — and the
+        absorbed record's provenance is preserved in full on the survivor's
+        ``merged_sources``. Corroboration can only strengthen the survivor:
+        confidence becomes the max of the two, stamped into
+        ``confidence_updated_at`` so a later decay pass anchors on the merge
+        moment instead of double-decaying the boost. The duplicate moves to
+        ``merged`` with ``merged_into`` naming the survivor; its record file
+        stays in the store, readable, never deleted.
+        """
+        if not reason.strip():
+            raise StoreError("merge requires a reason")
+        if primary_id == duplicate_id:
+            raise StoreError("cannot merge a record into itself")
+        primary = self._load(primary_id)
+        duplicate = self._load(duplicate_id)
+        if primary.status not in _LIVE_STATUSES:
+            raise StoreError(f"merge requires a live primary; {primary_id} is {primary.status}")
+        if duplicate.status not in _LIVE_STATUSES:
+            raise StoreError(
+                f"merge requires a live duplicate; {duplicate_id} is {duplicate.status}"
+            )
+        if primary.type != duplicate.type or primary.body != duplicate.body:
+            raise StoreError(
+                f"merge requires duplicates (same type, identical body); "
+                f"{primary_id} and {duplicate_id} differ"
+            )
+        merged_at = _now()
+        survivor = primary.model_copy(
+            update={
+                "confidence": max(primary.confidence, duplicate.confidence),
+                "confidence_updated_at": merged_at,
+                "merged_sources": [
+                    *primary.merged_sources,
+                    MergedSource(
+                        record_id=duplicate.id,
+                        title=duplicate.title,
+                        provenance=duplicate.provenance,
+                        confidence=duplicate.confidence,
+                        merged_at=merged_at,
+                    ),
+                    # A duplicate that had itself absorbed records hands
+                    # their provenance to the survivor: lineage transfer,
+                    # verbatim — never a summary of a summary.
+                    *duplicate.merged_sources,
+                ],
+            }
+        )
+        absorbed = duplicate.model_copy(update={"status": "merged", "merged_into": primary_id})
+        self._save(survivor)
+        self._save(absorbed)
+        self._append_audit(
+            AuditEvent(
+                event="merge",
+                record_id=duplicate_id,
+                from_status=duplicate.status,
+                to_status="merged",
+                reason=f"merged into {primary_id}: {reason}",
+            )
+        )
+        self._commit(f"merge: {duplicate_id} into {primary_id}")
+        return survivor
+
+    # ------------------------------------------------------- v2: decay
+
+    def decay(
+        self,
+        config: DecayConfig | None = None,
+        now: datetime | None = None,
+    ) -> list[LearningRecord]:
+        """Apply configured confidence decay to every live record.
+
+        Confidence decays on the configured exponential half-life curve
+        with an asymptotic floor, anchored on each record's
+        ``confidence_updated_at`` (or ``created`` for records that never
+        carried it) so passes compose exactly and a re-run at the same
+        instant is a no-op. Records flagged ``evergreen`` are exempt:
+        safety-critical knowledge is never aged toward the floor, so it
+        can never decay below retrieval consideration. Terminal states
+        (``dropped``/``merged``) are frozen — they are history, not live
+        belief. Returns the records whose confidence actually moved; a
+        pass that changes nothing writes no audit events and no empty
+        commit.
+        """
+        curve = config or DecayConfig()
+        moment = now or _now()
+        decayed: list[LearningRecord] = []
+        for record in self._all_records():
+            if record.status not in _LIVE_STATUSES or record.evergreen:
+                continue
+            anchor = record.confidence_updated_at or record.created
+            new_confidence = decayed_confidence(
+                record.confidence, since=anchor, now=moment, config=curve
+            )
+            if new_confidence >= record.confidence:
+                continue
+            updated = record.model_copy(
+                update={"confidence": new_confidence, "confidence_updated_at": moment}
+            )
+            self._save(updated)
+            decayed.append(updated)
+            self._append_audit(
+                AuditEvent(
+                    event="decay",
+                    record_id=record.id,
+                    from_status=record.status,
+                    to_status=record.status,
+                    reason=(
+                        f"confidence {record.confidence:.4f} -> {new_confidence:.4f} "
+                        f"(half-life {curve.half_life_days}d, floor {curve.floor})"
+                    ),
+                )
+            )
+        if decayed:
+            self._commit(f"decay: {len(decayed)} record(s) aged past the curve")
+        return decayed
+
+    # ------------------------------------------------------- v2: retire
+
+    def retire(self, learning_id: str, reason: str) -> LearningRecord:
+        """Move ``learning_id`` to the reversible ``retired`` state.
+
+        Staleness is not rejection: a retired record leaves retrieval
+        (promotion-only, and ``retired`` is not ``promoted``) but stays on
+        disk, readable, never deleted. ``retired_from`` remembers the prior
+        status and ``retired_at`` stamps the moment, so :meth:`reinstate`
+        can restore the record exactly. Live states only — ``dropped`` is
+        already a terminal rejection and ``merged`` a terminal absorption;
+        neither needs a second shelf.
+        """
+        if not reason.strip():
+            raise StoreError("retire requires a reason")
+        record = self._load(learning_id)
+        if record.status not in _LIVE_STATUSES:
+            raise StoreError(f"retire requires a live record; {learning_id} is {record.status}")
+        retired = record.model_copy(
+            update={"status": "retired", "retired_at": _now(), "retired_from": record.status}
+        )
+        self._save(retired)
+        self._append_audit(
+            AuditEvent(
+                event="retire",
+                record_id=learning_id,
+                from_status=record.status,
+                to_status="retired",
+                reason=reason,
+            )
+        )
+        self._commit(f"retire: {learning_id}")
+        return retired
+
+    def reinstate(self, learning_id: str) -> LearningRecord:
+        """Restore a retired record to exactly its pre-retirement state.
+
+        The reversibility half of the retirement contract: ``retired_from``
+        is restored verbatim and the retirement stamps are cleared, so a
+        reinstated record equals its pre-retirement self field-for-field.
+        The audit trail keeps both directions — history is never rewritten.
+        """
+        record = self._load(learning_id)
+        if record.status != "retired":
+            raise StoreError(
+                f"reinstate requires a retired record; {learning_id} is {record.status}"
+            )
+        restored = record.model_copy(
+            update={
+                "status": record.retired_from,
+                "retired_at": None,
+                "retired_from": None,
+            }
+        )
+        self._save(restored)
+        self._append_audit(
+            AuditEvent(
+                event="reinstate",
+                record_id=learning_id,
+                from_status="retired",
+                to_status=restored.status,
+                reason=f"reinstated from retirement (retired_from={record.retired_from})",
+            )
+        )
+        self._commit(f"reinstate: {learning_id}")
+        return restored
 
     # ----------------------------------------------------------- persistence
 

@@ -47,23 +47,92 @@ class RecordCounterfactual(BaseModel):
     evidence: str | None = None
 
 
+class MergedSource(BaseModel):
+    """Provenance of one duplicate absorbed by this record on merge.
+
+    Stored verbatim — the absorbed record's provenance is never rewritten
+    or summarized, so consolidation loses no lineage. V2-5's locked
+    non-goal is recursive summarization; this is the record-level
+    alternative: full provenance travels with the survivor.
+    """
+
+    record_id: str
+    title: str
+    provenance: RecordProvenance
+    confidence: float = Field(ge=0.0, le=1.0)
+    merged_at: datetime
+
+
+class DecayConfig(BaseModel):
+    """Configuration for the V2-5 confidence-decay curve.
+
+    Exponential half-life decay with an asymptotic floor: confidence is
+    never pushed below ``floor``, so even fully-aged knowledge stays a
+    visible, auditable belief. ``half_life_days > 0`` keeps the curve
+    well-defined; ``floor < 1`` keeps decay a decay.
+    """
+
+    half_life_days: float = Field(default=30.0, gt=0.0)
+    floor: float = Field(default=0.05, ge=0.0, lt=1.0)
+
+
+def decayed_confidence(
+    confidence: float,
+    *,
+    since: datetime,
+    now: datetime,
+    config: DecayConfig,
+) -> float:
+    """Confidence after exponential half-life decay with an asymptotic floor.
+
+    ``floor + (confidence - floor) * 2 ** (-age / half_life)``: unchanged at
+    zero age, halved above the floor at one half-life, never below the
+    configured floor. Decay only lowers — a confidence already under the
+    floor is left alone rather than lifted back toward it, and a ``now``
+    before ``since`` changes nothing.
+    """
+    if now <= since:
+        return confidence
+    age_days = (now - since).total_seconds() / 86400
+    decayed = config.floor + (confidence - config.floor) * 2.0 ** (
+        -age_days / config.half_life_days
+    )
+    return min(confidence, decayed)
+
+
 class LearningRecord(BaseModel):
     """A versioned unit of engine knowledge.
 
     Exactly one of ``failure-pattern``, ``playbook``, or ``check``, with a
     confidence in the closed interval ``[0, 1]`` and a lifecycle status.
+
+    V2-5 extends the v1 lifecycle with new states without breaking the
+    round-trip contract: ``merged`` marks a record absorbed into a
+    duplicate-free survivor (``merged_into`` names it; body and provenance
+    stay verbatim), and ``retired`` shelves a stale record reversibly —
+    ``retired_from`` remembers its prior status so reinstatement restores
+    it exactly. All new fields default, so v1 JSON validates unchanged.
     """
 
     id: str
     type: Literal["failure-pattern", "playbook", "check"]
     title: str
     body: RecordBody
-    status: Literal["ephemeral", "candidate", "promoted", "dropped"]
+    status: Literal[
+        "ephemeral", "candidate", "promoted", "dropped", "merged", "retired"
+    ]
     confidence: float = Field(ge=0.0, le=1.0)
     provenance: RecordProvenance
     counterfactual: RecordCounterfactual
     created: datetime
     promoted_at: datetime | None = None
+    # --- v2 lifecycle extensions (all defaulted: v1 round-trips intact) ---
+    merged_sources: list[MergedSource] = Field(default_factory=list)
+    merged_into: str | None = None
+    confidence_updated_at: datetime | None = None
+    evergreen: bool = False
+    retired_at: datetime | None = None
+    retired_from: str | None = None
 
     @classmethod
     def sample(cls) -> LearningRecord:

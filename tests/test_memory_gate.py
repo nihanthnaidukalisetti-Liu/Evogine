@@ -11,10 +11,17 @@ from pathlib import Path
 import pytest
 
 from evogine.engine.records import LearningRecord
+from evogine.gates.approvals import ApprovalError, ApprovalLog, ApprovalState
 from evogine.gates.materiality import Verdict
 from evogine.gates.memory_gate import MemoryGate
 from evogine.gates.replay import ReplayRun
-from evogine.gates.telemetry import DecisionLog, DecisionStage, RunsEvidenceSink
+from evogine.gates.telemetry import (
+    DecisionLog,
+    DecisionStage,
+    PromotionDecision,
+    RunsEvidenceSink,
+    TelemetryError,
+)
 
 
 class StubRunner:
@@ -58,9 +65,14 @@ def log(tmp_path: Path) -> DecisionLog:
 
 
 @pytest.fixture
-def gate_factory(log: DecisionLog):
+def approvals(tmp_path: Path) -> ApprovalLog:
+    return ApprovalLog(tmp_path / "store")
+
+
+@pytest.fixture
+def gate_factory(log: DecisionLog, approvals: ApprovalLog):
     def factory(runner: StubRunner, **kwargs) -> MemoryGate:
-        return MemoryGate(runner, log, **kwargs)
+        return MemoryGate(runner, log, approvals, **kwargs)
 
     return factory
 
@@ -68,22 +80,33 @@ def gate_factory(log: DecisionLog):
 # ------------------------------------------------------------- promote path
 
 
-def test_material_binary_flip_promotes(
-    gate_factory, log: DecisionLog, record: LearningRecord
+def test_material_binary_flip_renders_a_proposal(
+    gate_factory, approvals: ApprovalLog, record: LearningRecord, tmp_path: Path
 ) -> None:
+    """A cleared review proposes; it does not promote (V2-6)."""
     runner = StubRunner(
         {
             "cold-1": binary_run("cold-1", "baseline", [False, False, False]),
             "warm-1": binary_run("warm-1", "warm", [True, True, True]),
         }
     )
-    decision = gate_factory(runner).review(record, ["cold-1", "warm-1"])
+    decision = gate_factory(
+        runner, evidence=RunsEvidenceSink(tmp_path / "store")
+    ).review(record, ["cold-1", "warm-1"])
 
-    assert decision.promoted is True
-    assert decision.stage is DecisionStage.NEVER_WORSE
-    assert decision.reason == "cleared: 3 binary flips"
+    assert decision.promoted is False
+    assert decision.stage is DecisionStage.APPROVAL
+    assert decision.reason == "proposed: 3 binary flips"
     assert decision.replay_run_ids == ["cold-1", "warm-1"]
     assert decision.learning_id == decision.proposal_id == "prop-0001"
+
+    # The proposal waits in the approval log with the cleared trail attached.
+    pending = approvals.pending()
+    assert [proposal.proposal_id for proposal in pending] == ["appr-prop-0001"]
+    assert pending[0].learning_id == "prop-0001"
+    assert pending[0].decision.reason == "cleared: 3 binary flips"
+    assert pending[0].decision.promoted is True  # the gate's recommendation
+    assert pending[0].state is ApprovalState.PENDING
 
 
 def test_review_always_records_its_decision(
@@ -102,6 +125,7 @@ def test_review_always_records_its_decision(
     recorded = log.all()
     assert len(recorded) == 1
     assert recorded[0].proposal_id == "prop-0001"
+    assert recorded[0].stage is DecisionStage.APPROVAL
     assert recorded[0].decided_at.tzinfo is not None
 
 
@@ -277,7 +301,9 @@ def test_evidence_sink_records_the_ref(
             "warm-1": binary_run("warm-1", "warm", [True, True, True]),
         }
     )
-    gate = MemoryGate(runner, DecisionLog(store_root), evidence=evidence)
+    gate = MemoryGate(
+        runner, DecisionLog(store_root), ApprovalLog(store_root), evidence=evidence
+    )
     decision = gate.review(record, ["cold-1", "warm-1"])
 
     assert decision.evidence_ref == "runs/gate/prop-0001.json"
@@ -286,9 +312,15 @@ def test_evidence_sink_records_the_ref(
     assert "cold-1" in evidence_file.read_text(encoding="utf-8")
 
 
-def test_evidence_ref_is_none_without_a_sink(
-    gate_factory, record: LearningRecord
+def test_cleared_review_without_evidence_is_refused(
+    gate_factory, approvals: ApprovalLog, record: LearningRecord
 ) -> None:
+    """No proposal without replay evidence — regardless of the human (V2-6).
+
+    The knowledge cleared, but with no evidence sink there is nothing a
+    proposal could justify itself with: the review records the refusal and
+    the approval log stays empty.
+    """
     runner = StubRunner(
         {
             "cold-1": binary_run("cold-1", "baseline", [False, False, False]),
@@ -297,4 +329,35 @@ def test_evidence_ref_is_none_without_a_sink(
     )
     decision = gate_factory(runner).review(record, ["cold-1", "warm-1"])
 
+    assert decision.promoted is False
+    assert decision.stage is DecisionStage.APPROVAL
+    assert decision.reason.startswith("refused_no_evidence: no replay evidence")
     assert decision.evidence_ref is None
+    assert approvals.all() == []
+
+
+def test_render_refuses_a_proposal_without_evidence(approvals: ApprovalLog) -> None:
+    """The approval log itself refuses evidence-free renders."""
+    cleared = PromotionDecision(
+        proposal_id="prop-9",
+        learning_id="prop-9",
+        promoted=True,
+        stage=DecisionStage.NEVER_WORSE,
+        reason="cleared: 2 binary flips",
+    )
+    with pytest.raises(ApprovalError, match="no replay evidence"):
+        approvals.render("prop-9", cleared, None)
+    assert approvals.all() == []
+
+
+def test_render_rejects_a_trail_that_is_not_cleared(approvals: ApprovalLog) -> None:
+    """A proposal must carry the gate's cleared verdict; anything else is a bug."""
+    not_cleared = PromotionDecision(
+        proposal_id="prop-9",
+        learning_id="prop-9",
+        promoted=False,
+        stage=DecisionStage.REPLAY,
+        reason="no_flip: 0/3 replays changed verdict",
+    )
+    with pytest.raises(TelemetryError, match="not a cleared gate verdict"):
+        approvals.render("prop-9", not_cleared, "runs/gate/prop-9.json")

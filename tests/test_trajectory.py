@@ -19,6 +19,7 @@ from evogine.engine.records import (
     RecordCounterfactual,
     RecordProvenance,
 )
+from evogine.gates.approvals import ApprovalLog
 from evogine.gates.materiality import Verdict
 from evogine.gates.memory_gate import MemoryGate, run_promotion_pass
 from evogine.gates.replay import ReplayRun
@@ -83,7 +84,11 @@ def candidate(record_id: str, run_ids: list[str] | None = None) -> LearningRecor
 
 
 def make_gate(tmp_path: Path, runs: dict[str, ReplayRun], **flags: bool) -> MemoryGate:
-    kwargs: dict[str, object] = {}
+    kwargs: dict[str, object] = {
+        # V2-6: the approval boundary is required wiring — a gate without
+        # an approval log is misconfigured and clears nothing.
+        "approvals": ApprovalLog(tmp_path),
+    }
     if "with_evidence" in flags:
         kwargs["evidence"] = RunsEvidenceSink(tmp_path) if flags["with_evidence"] else None
     else:
@@ -154,11 +159,13 @@ def test_trajectory_captures_tool_calls_and_decision(tmp_path: Path):
 
     trajectory: Trajectory = TrajectoryStore(tmp_path).read(record.id)
     calls = trajectory.tool_calls()
-    # Tool calls included: one per replay fetch, plus the evidence write.
+    # Tool calls included: one per replay fetch, the evidence write, and
+    # the V2-6 proposal render that the cleared verdict's effect now is.
     assert [call.tool for call in calls] == [
         "replay_runner.run",
         "replay_runner.run",
         "evidence_sink.write",
+        "approvals.render",
     ]
     assert [call.arguments for call in calls[:2]] == [
         '{"run_id": "run-cold"}',
@@ -167,11 +174,17 @@ def test_trajectory_captures_tool_calls_and_decision(tmp_path: Path):
     assert "baseline: 2 verdict(s)" in calls[0].result
     assert "warm: 2 verdict(s)" in calls[1].result
     assert "wrote runs/gate/proposal-1.json" in calls[2].result
+    assert "rendered appr-proposal-1" in calls[3].result
     # The verdict step carries the stage outcome.
     decision_steps = [step for step in trajectory.steps if step.kind == "decision"]
     assert len(decision_steps) == 1
     assert "never_worse: cleared" in decision_steps[0].detail
-    assert decision.promoted and decision.stage is DecisionStage.NEVER_WORSE
+    # V2-6: the cleared verdict renders a pending proposal; it does not promote.
+    assert decision.promoted is False
+    assert decision.stage is DecisionStage.APPROVAL
+    assert [p.proposal_id for p in ApprovalLog(tmp_path).pending()] == [
+        "appr-proposal-1"
+    ]
 
 
 def test_gate_error_decision_still_gets_trajectory(tmp_path: Path):
@@ -199,6 +212,7 @@ def test_trajectory_sanitizes_secret_shaped_tool_output(tmp_path: Path):
     gate = MemoryGate(
         HostileRunner(),  # type: ignore[arg-type]
         DecisionLog(tmp_path),
+        approvals=ApprovalLog(tmp_path),
         evidence=RunsEvidenceSink(tmp_path),
         trajectories=TrajectoryStore(tmp_path),
     )

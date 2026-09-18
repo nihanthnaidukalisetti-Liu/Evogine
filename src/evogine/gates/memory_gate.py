@@ -10,16 +10,31 @@ for infrastructure failures, which is deliberately not a knowledge
 verdict. Every verdict is written to the :class:`DecisionLog` before it
 is returned: a decided proposal with no decision record is a bug (V2-1).
 
+V2-6: the gate no longer promotes. When the knowledge stages clear, the
+verdict becomes an *approval proposal* — record, replay evidence, and the
+cleared decision trail, rendered into the :class:`ApprovalLog` — and only
+``evogine approvals approve|reject`` applies or refuses it. The evidence
+requirement is enforced by the gate regardless of the human: a cleared
+review without replay evidence is refused, and the gate has no promotion
+path at all, so no promotion can exist without an approved proposal.
+
+V2-8: every decision also leaves a trajectory — the full path a review
+took (replay fetches, evidence write, proposal render, verdict), captured
+per review and written to the :class:`TrajectoryStore` when one is wired,
+so a verdict is always reconstructible from what actually happened.
+
 Gate errors neither promote nor demote — infrastructure says nothing about
-the knowledge, so the record stays a candidate for retry. Knowledge-stage
-rejections demote to ``dropped`` but stay in the store: rejected knowledge
-remains auditable, never deleted.
+the knowledge, so the record stays a candidate for retry. The same holds
+for an evidence refusal (the refusal is about the proposal, not the
+knowledge). Knowledge-stage rejections demote to ``dropped`` but stay in
+the store: rejected knowledge remains auditable, never deleted.
 """
 
 from __future__ import annotations
 
-from evogine.engine.records import LearningRecord, RecordCounterfactual
+from evogine.engine.records import LearningRecord
 from evogine.engine.store import Engine
+from evogine.gates.approvals import ApprovalError, ApprovalLog
 from evogine.gates.materiality import (
     MaterialityError,
     align_verdicts,
@@ -42,24 +57,29 @@ class MemoryGate:
 
     ``runner`` supplies the recorded replay results; ``log`` receives one
     decision per review (the V2-1 completeness invariant lives here — a
-    verdict that is not recorded never leaves the gate); ``evidence``, when
-    given, persists the paired verdicts and the decision's ``evidence_ref``
-    points into ``runs/``; ``trajectories``, when given, persists the full
-    review trajectory (tool calls included) per decision and stamps its
-    store-relative path on the decision's ``trajectory_ref`` (V2-8) — the
-    verdict plus the reconstructible path to it.
+    verdict that is not recorded never leaves the gate); ``approvals``
+    receives the rendered proposals (the V2-6 boundary — a gate without it
+    is misconfigured and clears nothing); ``evidence``, when given,
+    persists the paired verdicts so a cleared review can attach them to
+    the proposal — without it, nothing can be proposed; ``trajectories``,
+    when given, persists the full review trajectory (tool calls included)
+    per decision and stamps its store-relative path on the decision's
+    ``trajectory_ref`` (V2-8) — the verdict plus the reconstructible path
+    to it, the proposal render included.
     """
 
     def __init__(
         self,
         runner: ReplayRunner,
         log: DecisionLog,
+        approvals: ApprovalLog,
         evidence: RunsEvidenceSink | None = None,
         scored_threshold: float = 0.15,
         trajectories: TrajectoryStore | None = None,
     ) -> None:
         self._runner = runner
         self._log = log
+        self._approvals = approvals
         self._evidence = evidence
         self._scored_threshold = scored_threshold
         self._trajectories = trajectories
@@ -70,8 +90,13 @@ class MemoryGate:
         """Decide ``record`` from its counterfactual replay; record the verdict.
 
         ``replay_run_ids`` name the queued replay runs to inspect (the run
-        ids attached by ``Engine.queue_replay``). The returned
-        :class:`PromotionDecision` is already persisted in the log.
+        ids attached by ``Engine.queue_replay``). When the knowledge stages
+        clear, the verdict is rendered as a pending approval proposal —
+        the record itself is not promoted until
+        ``evogine approvals approve`` applies it; without replay evidence
+        the proposal is refused in the recorded decision instead. The
+        returned :class:`PromotionDecision` is already persisted in the
+        log, with its trajectory stamped when a store is wired.
         """
         trajectory = TrajectoryRecorder(gate="memory_gate", proposal_id=record.id)
         decision, evidence_payload = self._decide(record, replay_run_ids, trajectory)
@@ -83,11 +108,61 @@ class MemoryGate:
                 {"proposal_id": record.id},
                 result=f"wrote {evidence_ref}",
             )
+        if self._cleared(decision):
+            decision = self._render_proposal(decision, trajectory)
         if self._trajectories is not None:
             trajectory_ref = self._trajectories.write(record.id, trajectory.freeze())
             decision = decision.model_copy(update={"trajectory_ref": trajectory_ref})
         self._log.record(decision)
         return decision
+
+    @staticmethod
+    def _cleared(decision: PromotionDecision) -> bool:
+        """True when the knowledge stages cleared and only the human remains."""
+        return decision.stage is DecisionStage.NEVER_WORSE and decision.promoted
+
+    def _render_proposal(
+        self, cleared: PromotionDecision, trajectory: TrajectoryRecorder
+    ) -> PromotionDecision:
+        """Turn a cleared verdict into a proposal — or record its refusal.
+
+        The proposal carries the cleared decision trail and the evidence
+        ref; the returned decision (what the log records) says what this
+        review did: ``proposed`` — or ``refused_no_evidence``, when there
+        is no evidence to justify the proposal with. A refusal is not a
+        knowledge verdict: the record stays a candidate for a retry with
+        evidence wired. Both outcomes are captured in the trajectory.
+        """
+        detail = cleared.reason.removeprefix("cleared: ")
+
+        def approval(reason: str, evidence_ref: str | None) -> PromotionDecision:
+            check_reason(DecisionStage.APPROVAL, reason)
+            return cleared.model_copy(
+                update={
+                    "promoted": False,
+                    "stage": DecisionStage.APPROVAL,
+                    "reason": reason,
+                    "evidence_ref": evidence_ref,
+                }
+            )
+
+        try:
+            proposal = self._approvals.render(
+                cleared.learning_id, cleared, cleared.evidence_ref
+            )
+        except ApprovalError as exc:
+            trajectory.tool_call(
+                "approvals.render",
+                {"proposal_id": cleared.learning_id},
+                result=f"refused: {exc}",
+            )
+            return approval(f"refused_no_evidence: {exc}", None)
+        trajectory.tool_call(
+            "approvals.render",
+            {"proposal_id": cleared.learning_id},
+            result=f"rendered {proposal.proposal_id}",
+        )
+        return approval(f"proposed: {detail}", cleared.evidence_ref)
 
     def _decide(
         self,
@@ -210,27 +285,29 @@ class MemoryGate:
 def run_promotion_pass(engine: Engine, gate: MemoryGate) -> list[PromotionDecision]:
     """Run the gate over every candidate in the store and apply the verdict.
 
-    Passing records are promoted with their replay evidence; knowledge-stage
+    The gate never promotes (V2-6): a cleared candidate comes back as a
+    rendered proposal awaiting ``evogine approvals approve|reject`` — the
+    pass leaves it a candidate, untouched by the store. Knowledge-stage
     rejections are demoted to ``dropped`` (auditable, never deleted);
-    gate errors leave the record a candidate — infrastructure failures say
-    nothing about the knowledge, so it stays eligible for a retry. Returns
-    one decision per decided proposal, in store order. Every decision is
-    already persisted in the gate's log: a decided proposal without a
-    decision record is a bug (V2-1 completeness invariant).
+    gate errors and evidence refusals leave the record a candidate —
+    infrastructure says nothing about the knowledge, so it stays eligible
+    for a retry. Every decision leaves a trajectory when the gate has a
+    store wired (V2-8). Returns one decision per decided proposal, in
+    store order. Every decision is already persisted in the gate's log: a
+    decided proposal without a decision record is a bug (V2-1 completeness
+    invariant).
     """
     decisions: list[PromotionDecision] = []
     for record in engine.candidates():
         decision = gate.review(record, record.counterfactual.replay_run_ids)
-        if decision.promoted:
-            engine.promote(
-                record.id,
-                RecordCounterfactual(
-                    replay_run_ids=decision.replay_run_ids,
-                    verdict_change=True,
-                    evidence=decision.evidence_ref,
-                ),
-            )
-        elif decision.stage is not DecisionStage.GATE_ERROR:
+        # Only knowledge-stage rejections move the store. GATE_ERROR is
+        # infrastructure (retryable); APPROVAL is the human boundary —
+        # proposed or refused, the decision belongs to a person, not a pass.
+        if (
+            not decision.promoted
+            and decision.stage is not DecisionStage.GATE_ERROR
+            and decision.stage is not DecisionStage.APPROVAL
+        ):
             engine.demote(record.id, decision.reason)
         decisions.append(decision)
     return decisions

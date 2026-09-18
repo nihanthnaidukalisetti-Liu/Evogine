@@ -14,6 +14,7 @@ import pytest
 from evogine.cli import main
 from evogine.engine.records import LearningRecord
 from evogine.engine.store import Engine
+from evogine.gates.approvals import ApprovalLog, ApprovalState
 from evogine.gates.materiality import Verdict
 from evogine.gates.memory_gate import MemoryGate, run_promotion_pass
 from evogine.gates.replay import ReplayRun
@@ -129,6 +130,7 @@ def test_counts_by_stage_is_zero_filled(tmp_path: Path) -> None:
         DecisionStage.REPLAY: 1,
         DecisionStage.MATERIALITY: 0,
         DecisionStage.NEVER_WORSE: 0,
+        DecisionStage.APPROVAL: 0,
         DecisionStage.GATE_ERROR: 1,
     }
 
@@ -188,6 +190,7 @@ def test_report_renders_counts_by_stage(tmp_path: Path, capsys) -> None:
         "  replay: 1\n"
         "  materiality: 1\n"
         "  never_worse: 2\n"
+        "  approval: 0\n"
         "  gate_error: 1\n"
         "promoted: 1\n"
     )
@@ -203,6 +206,7 @@ def test_report_renders_an_empty_log_as_zeros(tmp_path: Path, capsys) -> None:
         "  replay: 0\n"
         "  materiality: 0\n"
         "  never_worse: 0\n"
+        "  approval: 0\n"
         "  gate_error: 0\n"
         "promoted: 0\n"
     )
@@ -246,7 +250,10 @@ def promotion_pass_over(store: Engine) -> list[PromotionDecision]:
         }
     )
     gate = MemoryGate(
-        runner, DecisionLog(store.root), evidence=RunsEvidenceSink(store.root)
+        runner,
+        DecisionLog(store.root),
+        ApprovalLog(store.root),
+        evidence=RunsEvidenceSink(store.root),
     )
     return run_promotion_pass(store, gate)
 
@@ -269,7 +276,7 @@ def test_promotion_pass_records_exactly_one_decision_per_proposal(
 def test_promotion_pass_hit_every_decision_stage(
     store: Engine, candidates_in_store
 ) -> None:
-    """Stages are enumerable: the pass corpus exercises all four."""
+    """Stages are enumerable: the pass corpus exercises all five."""
     decisions = promotion_pass_over(store)
 
     assert {d.stage for d in decisions} == set(DecisionStage)
@@ -287,17 +294,24 @@ def test_promotion_pass_reasons_all_match_their_stage_templates(
 def test_promotion_pass_applies_lifecycle_verdicts(
     store: Engine, candidates_in_store
 ) -> None:
-    """Passing promotes, knowledge-stage rejects demote, gate errors wait."""
+    """Cleared candidates render proposals (no promotion); rejects demote."""
     decisions = promotion_pass_over(store)
     by_id = {d.proposal_id: d for d in decisions}
 
-    promoted = store.get("prop-a")
-    assert by_id["prop-a"].promoted is True
-    assert promoted.status == "promoted"
-    assert promoted.promoted_at is not None
-    assert promoted.counterfactual.verdict_change is True
-    assert promoted.counterfactual.evidence == "runs/gate/prop-a.json"
-    assert store.retrieve("429 backoff")[0].id == "prop-a"
+    # prop-a cleared every knowledge stage: the pass rendered a pending
+    # proposal and stopped — the store is untouched until a human decides.
+    assert by_id["prop-a"].stage is DecisionStage.APPROVAL
+    assert by_id["prop-a"].promoted is False
+    assert by_id["prop-a"].reason == "proposed: 3 binary flips"
+    proposed = store.get("prop-a")
+    assert proposed.status == "candidate"
+
+    proposal = ApprovalLog(store.root).get("appr-prop-a")
+    assert proposal.state is ApprovalState.PENDING
+    assert proposal.learning_id == "prop-a"
+    assert proposal.decision.reason == "cleared: 3 binary flips"
+    assert proposal.decision.promoted is True  # the gate's recommendation
+    assert proposal.evidence_ref == "runs/gate/prop-a.json"
 
     for rejected in ("prop-b", "prop-c", "prop-d"):
         assert store.get(rejected).status == "dropped", by_id[rejected].reason

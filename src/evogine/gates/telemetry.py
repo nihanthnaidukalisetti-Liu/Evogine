@@ -28,12 +28,14 @@ class DecisionStage(str, Enum):
     REPLAY — did the warm verdict actually flip?
     MATERIALITY — did the flip qualify as material?
     NEVER_WORSE — did any evaluated case regress?
+    APPROVAL — did a human approve the rendered proposal? (V2-6)
     GATE_ERROR — infrastructure, not knowledge.
     """
 
     REPLAY = "replay"
     MATERIALITY = "materiality"
     NEVER_WORSE = "never_worse"
+    APPROVAL = "approval"
     GATE_ERROR = "gate_error"
 
 
@@ -47,7 +49,8 @@ class PromotionDecision(BaseModel):
     ``proposal_id`` and ``learning_id`` hold the same value today — the v1
     store treats one record as one proposal — but stay separate fields so
     the V2-6 approval boundary can give proposals their own identity
-    without breaking this schema.
+    without breaking this schema (realized as the approval proposal's
+    ``appr-<learning_id>`` id).
     """
 
     proposal_id: str
@@ -76,6 +79,7 @@ _STAGE_REASON_LABELS: dict[DecisionStage, frozenset[str]] = {
     DecisionStage.REPLAY: frozenset({"no_flip"}),
     DecisionStage.MATERIALITY: frozenset({"not_material"}),
     DecisionStage.NEVER_WORSE: frozenset({"regression", "cleared"}),
+    DecisionStage.APPROVAL: frozenset({"proposed", "refused_no_evidence"}),
     DecisionStage.GATE_ERROR: frozenset({"gate_error"}),
 }
 
@@ -86,6 +90,12 @@ _REASON_PATTERNS: dict[str, re.Pattern[str]] = {
     "cleared": re.compile(
         r"cleared: (?:\d+ binary flips|scored delta -?\d+\.\d{3} vs threshold \d+(?:\.\d+)?)"
     ),
+    # The proposed reason carries the same materiality detail as `cleared`:
+    # the proposal exists because the cleared detail justified promotion.
+    "proposed": re.compile(
+        r"proposed: (?:\d+ binary flips|scored delta -?\d+\.\d{3} vs threshold \d+(?:\.\d+)?)"
+    ),
+    "refused_no_evidence": re.compile(r"refused_no_evidence: .+"),
     "gate_error": re.compile(r"gate_error: .+"),
 }
 

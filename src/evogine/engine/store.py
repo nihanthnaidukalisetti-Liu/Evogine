@@ -25,12 +25,17 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from evogine.engine.records import LearningRecord, RecordCounterfactual
+from evogine.engine.records import LearningRecord, MergedSource, RecordCounterfactual
 
 # Ids become filenames under ``records/``: lock them to filesystem- and
 # git-safe characters so a malicious proposal can never traverse paths
 # (the security review's staging-traversal lesson, applied at the boundary).
 _ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+# States that participate in the live lifecycle. ``dropped`` is a terminal
+# rejection, ``merged`` a terminal absorption — neither merges, decays, nor
+# retires further; their records stay readable for audit either way.
+_LIVE_STATUSES = ("ephemeral", "candidate", "promoted")
 
 _WORD_RE = re.compile(r"[a-z0-9]+")
 
@@ -48,7 +53,7 @@ class AuditEvent(BaseModel):
 
     seq: int = 0
     ts: datetime = Field(default_factory=_now)
-    event: Literal["propose", "queue_replay", "promote", "demote"]
+    event: Literal["propose", "queue_replay", "promote", "demote", "merge"]
     record_id: str
     from_status: str | None = None
     to_status: str
@@ -300,6 +305,92 @@ class Engine:
         )
         self._commit(f"demote: {learning_id}")
         return dropped
+
+    # ------------------------------------------------------- v2: merge
+
+    def find_duplicates(self) -> list[tuple[str, str]]:
+        """Return pairs of live records that are exact duplicates.
+
+        Deliberately deterministic record-level detection: two records are
+        duplicates when they share a ``type`` and all four :class:`RecordBody`
+        fields are identical. Title-only differences still merge — the body
+        carries the knowledge, the title is presentation. Paraphrase-level
+        detection belongs to the retrieval layer (V2-3), not to a
+        guess-prone heuristic here. Pairs come back ordered by id.
+        """
+        live = [r for r in self._all_records() if r.status in _LIVE_STATUSES]
+        duplicates: list[tuple[str, str]] = []
+        for i, first in enumerate(live):
+            for second in live[i + 1 :]:
+                if first.type == second.type and first.body == second.body:
+                    duplicates.append((first.id, second.id))
+        return duplicates
+
+    def merge(self, primary_id: str, duplicate_id: str, reason: str) -> LearningRecord:
+        """Consolidate ``duplicate_id`` into ``primary_id`` (exact duplicates).
+
+        Record-level consolidation: the survivor keeps its own body and
+        provenance verbatim — nothing is summarized or rewritten — and the
+        absorbed record's provenance is preserved in full on the survivor's
+        ``merged_sources``. Corroboration can only strengthen the survivor:
+        confidence becomes the max of the two, stamped into
+        ``confidence_updated_at`` so a later decay pass anchors on the merge
+        moment instead of double-decaying the boost. The duplicate moves to
+        ``merged`` with ``merged_into`` naming the survivor; its record file
+        stays in the store, readable, never deleted.
+        """
+        if not reason.strip():
+            raise StoreError("merge requires a reason")
+        if primary_id == duplicate_id:
+            raise StoreError("cannot merge a record into itself")
+        primary = self._load(primary_id)
+        duplicate = self._load(duplicate_id)
+        if primary.status not in _LIVE_STATUSES:
+            raise StoreError(f"merge requires a live primary; {primary_id} is {primary.status}")
+        if duplicate.status not in _LIVE_STATUSES:
+            raise StoreError(
+                f"merge requires a live duplicate; {duplicate_id} is {duplicate.status}"
+            )
+        if primary.type != duplicate.type or primary.body != duplicate.body:
+            raise StoreError(
+                f"merge requires duplicates (same type, identical body); "
+                f"{primary_id} and {duplicate_id} differ"
+            )
+        merged_at = _now()
+        survivor = primary.model_copy(
+            update={
+                "confidence": max(primary.confidence, duplicate.confidence),
+                "confidence_updated_at": merged_at,
+                "merged_sources": [
+                    *primary.merged_sources,
+                    MergedSource(
+                        record_id=duplicate.id,
+                        title=duplicate.title,
+                        provenance=duplicate.provenance,
+                        confidence=duplicate.confidence,
+                        merged_at=merged_at,
+                    ),
+                    # A duplicate that had itself absorbed records hands
+                    # their provenance to the survivor: lineage transfer,
+                    # verbatim — never a summary of a summary.
+                    *duplicate.merged_sources,
+                ],
+            }
+        )
+        absorbed = duplicate.model_copy(update={"status": "merged", "merged_into": primary_id})
+        self._save(survivor)
+        self._save(absorbed)
+        self._append_audit(
+            AuditEvent(
+                event="merge",
+                record_id=duplicate_id,
+                from_status=duplicate.status,
+                to_status="merged",
+                reason=f"merged into {primary_id}: {reason}",
+            )
+        )
+        self._commit(f"merge: {duplicate_id} into {primary_id}")
+        return survivor
 
     # ----------------------------------------------------------- persistence
 

@@ -27,7 +27,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 from evogine.engine.records import LearningRecord, RecordCounterfactual
-from evogine.engine.store import Engine
+from evogine.engine.store import Engine, store_lock
 from evogine.gates.telemetry import (
     # Package-internal reuse: the same filesystem-safe id rule the decision
     # log and the store apply — proposals become filenames under approvals/.
@@ -240,6 +240,11 @@ def approve_proposal(
 ) -> LearningRecord:
     """Apply an approved proposal: the human decision promotes the record.
 
+    The store's advisory review lock is held across the whole window, so a
+    concurrent second decision — from the CLI or any transport — blocks
+    and then fails its own pending re-check below instead of racing this
+    one (V3: the boundary's read-modify-write window is the one real TOCTOU).
+
     Order is fail-safe: the proposal is verified (pending, evidence
     attached, record still a candidate) and the human approval is recorded
     before the store is touched — every failure window leaves the
@@ -248,35 +253,36 @@ def approve_proposal(
     re-checks its own promotion invariants (run coverage, verdict change);
     the boundary applies the promotion, it never bypasses the store's.
     """
-    proposal = log.get(proposal_id)
-    if proposal.state is not ApprovalState.PENDING:
-        raise ApprovalError(
-            f"proposal {proposal_id} is already {proposal.state.value}; "
-            "decided proposals are final"
+    with store_lock(engine.root):
+        proposal = log.get(proposal_id)
+        if proposal.state is not ApprovalState.PENDING:
+            raise ApprovalError(
+                f"proposal {proposal_id} is already {proposal.state.value}; "
+                "decided proposals are final"
+            )
+        # Defense in depth: a proposal file that lost its evidence after render
+        # (hand-edit, partial write) must not survive the human step either.
+        if proposal.evidence_ref is None:
+            raise ApprovalError(
+                f"proposal {proposal_id} carries no replay evidence; cannot approve"
+            )
+        record = engine.get(proposal.learning_id)
+        if record.status != "candidate":
+            raise ApprovalError(
+                f"proposal {proposal_id} cannot be approved: {proposal.learning_id} "
+                f"is {record.status}, not candidate"
+            )
+        log.record_approval(proposal_id, decided_by=decided_by, reason=reason)
+        promoted = engine.promote(
+            proposal.learning_id,
+            RecordCounterfactual(
+                replay_run_ids=proposal.decision.replay_run_ids,
+                verdict_change=True,
+                evidence=proposal.evidence_ref,
+            ),
         )
-    # Defense in depth: a proposal file that lost its evidence after render
-    # (hand-edit, partial write) must not survive the human step either.
-    if proposal.evidence_ref is None:
-        raise ApprovalError(
-            f"proposal {proposal_id} carries no replay evidence; cannot approve"
-        )
-    record = engine.get(proposal.learning_id)
-    if record.status != "candidate":
-        raise ApprovalError(
-            f"proposal {proposal_id} cannot be approved: {proposal.learning_id} "
-            f"is {record.status}, not candidate"
-        )
-    log.record_approval(proposal_id, decided_by=decided_by, reason=reason)
-    promoted = engine.promote(
-        proposal.learning_id,
-        RecordCounterfactual(
-            replay_run_ids=proposal.decision.replay_run_ids,
-            verdict_change=True,
-            evidence=proposal.evidence_ref,
-        ),
-    )
-    log.record_applied(proposal_id)
-    return promoted
+        log.record_applied(proposal_id)
+        return promoted
 
 
 def reject_proposal(
@@ -289,6 +295,10 @@ def reject_proposal(
 ) -> LearningRecord:
     """Refuse a proposal and demote the record: rejection is a knowledge verdict.
 
+    The store's advisory review lock is held across the whole window, as in
+    :func:`approve_proposal` — a concurrent second decision blocks and then
+    fails its own pending re-check.
+
     The human's identity and reason are recorded on the proposal, and the
     record is demoted to ``dropped`` — the store's rejection state,
     auditable, never deleted. Demotion matches the gate's own
@@ -298,6 +308,7 @@ def reject_proposal(
     failure (the record already dropped, say) still shows who refused and
     why.
     """
-    proposal = log.get(proposal_id)
-    log.record_rejection(proposal_id, decided_by=decided_by, reason=reason)
-    return engine.demote(proposal.learning_id, f"rejected by {decided_by}: {reason}")
+    with store_lock(engine.root):
+        proposal = log.get(proposal_id)
+        log.record_rejection(proposal_id, decided_by=decided_by, reason=reason)
+        return engine.demote(proposal.learning_id, f"rejected by {decided_by}: {reason}")

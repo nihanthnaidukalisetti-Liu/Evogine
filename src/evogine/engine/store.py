@@ -16,9 +16,12 @@ store commits can never sweep up unrelated files.
 
 from __future__ import annotations
 
+import fcntl
 import os
 import re
 import subprocess
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
@@ -41,10 +44,43 @@ from evogine.engine.retrieval import retrieve as hybrid_retrieve
 # (the security review's staging-traversal lesson, applied at the boundary).
 _ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
+#: The advisory lock file at the store root. The store's own git repo tracks
+#: it from the first lifecycle commit, so no runtime file is ever left
+#: untracked (the porcelain-clean property the audit tests pin); ``flock``
+#: needs only the file to exist — its content is never read or written.
+LOCK_FILENAME = "review.lock"
+
+
+@contextmanager
+def store_lock(root: Path | str) -> Iterator[None]:
+    """Hold the store's exclusive advisory review lock for a critical window.
+
+    ``approve_proposal``/``reject_proposal`` hold it across their whole
+    pending-check -> commit window, so a second concurrent decision — from
+    the CLI or any future transport — blocks, then fails its own re-check
+    of pending status and refuses cleanly instead of corrupting the store.
+    The documented contract stays "one writer at a time per store root";
+    the lock makes the contract enforced instead of assumed.
+
+    ``flock`` is advisory and crash-safe: the kernel drops the lock when the
+    holding file description closes, so a killed worker cannot strand the
+    store. Never nest: re-acquiring inside the window deadlocks, because the
+    lock is held per open file description.
+    """
+    lock_path = Path(root) / LOCK_FILENAME
+    with lock_path.open("a") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 # States that participate in the live lifecycle. ``dropped`` is a terminal
 # rejection, ``merged`` a terminal absorption — neither merges, decays, nor
 # retires further; their records stay readable for audit either way.
 _LIVE_STATUSES = ("ephemeral", "candidate", "promoted")
+
 
 class StoreError(Exception):
     """Lifecycle violation, unknown id, or malformed proposal."""
@@ -114,6 +150,11 @@ class Engine:
         self.records_dir.mkdir(parents=True, exist_ok=True)
         if not (self.root / ".git").exists():
             _git(self.root, "init", "-q")
+        # The review lock file exists from store birth so the first lifecycle
+        # commit versions it — a lock file created lazily could be left
+        # untracked by a refused boundary action (no commit follows a refusal).
+        self.lock_path = self.root / LOCK_FILENAME
+        self.lock_path.touch()
 
     # ---------------------------------------------------------------- reads
 
@@ -163,7 +204,9 @@ class Engine:
         store-owned: drafts arrive unproven, so anything else is refused.
         """
         if draft.status != "ephemeral":
-            raise StoreError(f"propose stores ephemeral records; draft {draft.id} is {draft.status}")
+            raise StoreError(
+                f"propose stores ephemeral records; draft {draft.id} is {draft.status}"
+            )
         counterfactual = draft.counterfactual
         if (
             counterfactual.replay_run_ids

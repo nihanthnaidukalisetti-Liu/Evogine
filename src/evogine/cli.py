@@ -58,6 +58,7 @@ from evogine.bench.harness import (
     REPEAT_FLOOR,
     BenchHarness,
     CaseRunner,
+    RunArtifacts,
     refuse_contaminated_holdout,
 )
 from evogine.bench.live import LiveCaseRunner
@@ -70,7 +71,7 @@ from evogine.bench.protocol import (
     pre_run_validate,
 )
 from evogine.bench.replay import ReplaySchedule, build_replay_requests
-from evogine.bench.rundirs import RunCompleteError
+from evogine.bench.rundirs import RunCompleteError, open_run
 from evogine.bench.runner import KnowledgeRunner
 from evogine.bench.shadow import ShadowRefusalError, load_shadow_candidate, run_shadow_pass
 from evogine.engine.store import Engine, StoreError
@@ -177,6 +178,13 @@ def main(argv: list[str] | None = None) -> int:
         help="output price per million tokens in USD (live; required)",
     )
 
+    bench_parser.add_argument(
+        "--run-id",
+        default=None,
+        dest="run_id",
+        help="resume a specific run directory instead of starting a fresh one",
+    )
+
     shadow_parser = subparsers.add_parser(
         "shadow",
         help="shadow-pass profiling of a candidate config — never mutates the store (V3 W2)",
@@ -269,6 +277,7 @@ def main(argv: list[str] | None = None) -> int:
             as_json=args.format == "json",
             runner_name=args.runner,
             protocol_path=args.protocol,
+            run_id=args.run_id,
             model=args.model,
             max_cost_usd=args.max_cost_usd,
             expected_input_tokens=args.expected_input_tokens,
@@ -304,7 +313,13 @@ def _run(root: str, *, repeats: int) -> int:
     """Drive a full promotion pass; exit 2 on any gate-error decision."""
     engine = Engine(root)
     gate = MemoryGate(
-        runner=HarnessReplayRunner(engine, KnowledgeRunner(), corpus=None, repeats=repeats),
+        runner=HarnessReplayRunner(
+            engine,
+            KnowledgeRunner(),
+            corpus=None,
+            repeats=repeats,
+            runs_root=Path(root) / "runs" / "replay",
+        ),
         log=DecisionLog(root),
         approvals=ApprovalLog(root),
         evidence=RunsEvidenceSink(root),
@@ -407,6 +422,7 @@ def _bench(
     as_json: bool,
     runner_name: str,
     protocol_path: str | None,
+    run_id: str | None,
     model: str | None,
     max_cost_usd: str | None,
     expected_input_tokens: int | None,
@@ -431,7 +447,6 @@ def _bench(
             return _refuse(f"protocol {protocol_path} refused: {exc}")
 
     engine = Engine(root)
-    live_runner: LiveCaseRunner | None = None
     if runner_name == "live":
         api_key = _resolve_provider_key()
         if api_key is None:
@@ -469,11 +484,20 @@ def _bench(
         except (ProtocolValidationError, ContaminationError, SpendCeilingExceededError) as exc:
             return _refuse(str(exc))
         assert model is not None  # refused above when absent
-        live_runner = LiveCaseRunner(
-            _build_live_client(api_key=api_key, model=model), DEFAULT_PROMPT_PACK
-        )
+        live_client: ModelClient | None = _build_live_client(api_key=api_key, model=model)
+    else:
+        live_client = None
 
-    harness_runner: CaseRunner = live_runner if live_runner is not None else KnowledgeRunner()
+    # All refusals are done: open the run directory and persist evidence.
+    try:
+        run_dir = open_run(Path(root) / "runs" / "bench", run_id=run_id)
+    except ValueError as exc:  # includes RunCompleteError: completed runs are immutable
+        return _refuse(str(exc))
+    harness_runner: CaseRunner
+    if live_client is not None:
+        harness_runner = LiveCaseRunner(live_client, DEFAULT_PROMPT_PACK, run=run_dir)
+    else:
+        harness_runner = KnowledgeRunner()
     harness_repeats = (
         repeats
         if protocol is not None
@@ -483,12 +507,16 @@ def _bench(
         report = BenchHarness(engine, harness_runner).run(
             repeats=harness_repeats,
             protocol=protocol,
+            artifacts=RunArtifacts(run_dir),
         )
+        run_dir.mark_complete()
     except (StoreError, ValueError, ProtocolValidationError, ContaminationError) as exc:
         return _refuse(str(exc))
     summary = report.summary
     if as_json:
         payload = {
+            "run_id": run_dir.run_id,
+            "run_dir": str(run_dir.directory),
             "repeats": summary.repeats,
             "replays": summary.replays,
             "cold_pass_rate": summary.cold_pass_rate,
@@ -506,11 +534,12 @@ def _bench(
         }
         print(json.dumps(payload, indent=2))
         return 0
-    runner_label = "live" if live_runner is not None else "offline"
+    runner_label = "live" if live_client is not None else "offline"
     print(
         f"bench ({runner_label} runner): {len(report.cases)} cases, "
         f"{summary.replays} replays at {summary.repeats} repeats"
     )
+    print(f"  run dir: {run_dir.directory}")
     print(f"  cold pass rate: {summary.cold_pass_rate:.3f}")
     print(f"  warm pass rate: {summary.warm_pass_rate:.3f}")
     print(f"  mean delta:     {summary.mean_delta_pass_rate:+.3f}")

@@ -10,6 +10,7 @@ the first dollar moves.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -19,10 +20,11 @@ from conftest import make_record, replay_evidence
 from evogine import cli
 from evogine.bench.cases import default_corpus
 from evogine.bench.gate_replay import replay_run_ids
-from evogine.bench.harness import REPEAT_FLOOR
+from evogine.bench.harness import REPEAT_FLOOR, CaseOutcome, RunArtifacts
 from evogine.bench.probes import content_tokens
 from evogine.bench.prompts import DEFAULT_PROMPT_PACK
 from evogine.bench.protocol import fingerprint_corpus
+from evogine.bench.rundirs import open_run
 from evogine.engine.store import Engine
 from evogine.swarm.clients import ModelClient, ModelRequest, ModelResponse
 
@@ -365,6 +367,21 @@ def test_live_refuses_a_contaminated_holdout_before_spend(
     assert not (root / "runs").exists()
 
 
+def _bench_live_argv(root: Path, protocol: Path, *extra: str) -> list[str]:
+    """The live bench argv: root, protocol, spend flags, plus extras."""
+    return [
+        "bench",
+        "--root",
+        str(root),
+        "--runner",
+        "live",
+        "--protocol",
+        str(protocol),
+        *LIVE_SPEND_FLAGS,
+        *extra,
+    ]
+
+
 def test_live_run_with_a_fake_client_completes_the_full_schedule(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -374,22 +391,80 @@ def test_live_run_with_a_fake_client_completes_the_full_schedule(
     protocol = _protocol_yaml(tmp_path)  # repeats 4
     seam = _patch_live_seams(monkeypatch, with_key=True)
 
-    exit_code = cli.main(
-        [
-            "bench",
-            "--root",
-            str(root),
-            "--runner",
-            "live",
-            "--protocol",
-            str(protocol),
-            "--format",
-            "json",
-            *LIVE_SPEND_FLAGS,
-        ]
-    )
+    exit_code = cli.main([*_bench_live_argv(root, protocol), "--format", "json"])
 
     assert exit_code == 0
     assert seam.resolved_key == "offline-fake-key"
     assert seam.resolved_model == "fake-model"
     assert len(seam.client.requests) == 80  # 10 cases x 2 arms x 4 repeats
+
+
+def test_live_run_persists_a_resumable_run_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A fake-client full schedule persists complete per-outcome and per-call evidence."""
+    root = tmp_path / "store"
+    protocol = _protocol_yaml(tmp_path)  # repeats 4
+    seam = _patch_live_seams(monkeypatch, with_key=True)
+
+    assert cli.main([*_bench_live_argv(root, protocol), "--format", "json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    run_dir = Path(payload["run_dir"])
+    assert payload["run_id"]
+    assert (run_dir / "complete.marker").exists()
+    artifacts = run_dir / "artifacts"
+    assert len(list(artifacts.glob("outcome-*.json"))) == 80  # 10 cases x 2 arms x 4 repeats
+    assert len(list(artifacts.glob("call-*.json"))) == 80  # one token record per call
+    assert len(seam.client.requests) == 80
+
+
+def test_live_resume_reuses_persisted_outcomes_without_re_spending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A resumed run reuses the persisted outcome and re-runs only the rest."""
+    root = tmp_path / "store"
+    protocol = _protocol_yaml(tmp_path)  # repeats 4
+    run = open_run(root / "runs" / "bench", run_id="live-resume")
+    RunArtifacts(run).save(
+        CaseOutcome(
+            case_id="retry-jitter-budget",
+            arm="cold",
+            repeat=0,
+            passed=False,
+            output="pre-existing",
+            knowledge_ids=[],
+        )
+    )
+    seam = _patch_live_seams(monkeypatch, with_key=True)
+
+    assert cli.main([*_bench_live_argv(root, protocol), "--run-id", "live-resume"]) == 0
+    assert len(seam.client.requests) == 79  # one replay reused, none re-spent
+    assert (run.directory / "complete.marker").exists()
+    outcome = json.loads(
+        (run.directory / "artifacts" / "outcome-retry-jitter-budget-cold-0000.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert outcome["output"] == "pre-existing"
+
+
+def test_resuming_a_completed_run_is_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A completed run directory is immutable evidence — resuming it refuses."""
+    root = tmp_path / "store"
+    protocol = _protocol_yaml(tmp_path)  # repeats 4
+    seam = _patch_live_seams(monkeypatch, with_key=True)
+
+    assert cli.main([*_bench_live_argv(root, protocol), "--format", "json"]) == 0
+    run_id = json.loads(capsys.readouterr().out)["run_id"]
+    calls_before = len(seam.client.requests)
+
+    assert cli.main([*_bench_live_argv(root, protocol), "--run-id", run_id]) == 1
+    assert "immutable" in capsys.readouterr().err
+    assert len(seam.client.requests) == calls_before  # no re-spend on refusal

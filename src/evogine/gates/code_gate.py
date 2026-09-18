@@ -28,7 +28,8 @@ from evogine.gates.equivalence import (
     differential_flips,
     never_worse_regression,
 )
-from evogine.sandbox.docker_runner import DockerSandbox
+from evogine.gates.wallclock import crosscheck_too_fast_pass
+from evogine.sandbox.docker_runner import SandboxResult
 from evogine.sandbox.sanitize import sanitize_output
 from evogine.sandbox.staging import (
     PatchRejected,
@@ -72,6 +73,10 @@ class EvalCase(BaseModel):
     case_id: str
     command: str
     env: dict[str, str] = Field(default_factory=dict)
+    # P2 wall-clock cross-check: a PASS must not arrive faster than the case
+    # could genuinely execute. ``None`` disables the check for the case; the
+    # pinned suite always carries a floor (see DEFAULT_SUITE).
+    min_pass_seconds: float | None = Field(default=None, gt=0)
 
 
 class GateCheckResult(BaseModel):
@@ -99,28 +104,80 @@ class CaseEvaluator(Protocol):
     def run_case(self, tree: str, staging: Path, case: EvalCase) -> CaseResult: ...
 
 
-class DockerCaseEvaluator:
-    """CaseEvaluator that executes cases inside the Docker sandbox."""
+class SandboxRun(Protocol):
+    """What a case evaluator needs from the sandbox: one sanitized command run.
 
-    def __init__(self, sandbox: DockerSandbox) -> None:
+    :class:`DockerSandbox` satisfies this structurally; offline tests stub it
+    with canned :class:`SandboxResult` values.
+    """
+
+    def run(
+        self,
+        command: str,
+        *,
+        staging_dir: Path | None = None,
+        env: Mapping[str, str] | None = None,
+        workdir: str | None = None,
+    ) -> SandboxResult: ...
+
+
+class DockerCaseEvaluator:
+    """CaseEvaluator that executes cases inside the Docker sandbox.
+
+    Applies the verifier's wall-clock cross-check (P2): a PASS the sandbox
+    reports faster than the case's ``min_pass_seconds`` floor is a verifier
+    failure and fails closed — the case is recorded as failed with the
+    cross-check reason, never as a pass.
+    """
+
+    def __init__(self, sandbox: SandboxRun) -> None:
         self._sandbox = sandbox
 
     def run_case(self, tree: str, staging: Path, case: EvalCase) -> CaseResult:
         result = self._sandbox.run(case.command, staging_dir=staging, env=case.env)
+        duration_ms = float(result.duration_ms)
         if result.exit_code == 0 and not result.timed_out:
-            return CaseResult(case_id=case.case_id, verdict=CaseVerdict.PASS, detail="exit 0")
+            if case.min_pass_seconds is not None:
+                too_fast = crosscheck_too_fast_pass(
+                    verdict=CaseVerdict.PASS,
+                    duration_ms=duration_ms,
+                    min_pass_seconds=case.min_pass_seconds,
+                )
+                if too_fast is not None:
+                    return CaseResult(
+                        case_id=case.case_id,
+                        verdict=CaseVerdict.FAIL,
+                        detail=too_fast,
+                        duration_ms=duration_ms,
+                    )
+            return CaseResult(
+                case_id=case.case_id,
+                verdict=CaseVerdict.PASS,
+                detail="exit 0",
+                duration_ms=duration_ms,
+            )
         detail = f"exit {result.exit_code}" + (" (timed out)" if result.timed_out else "")
         tail = result.stderr or result.stdout
         if tail:
             detail += f"; output tail: {tail[-200:]}"
-        return CaseResult(case_id=case.case_id, verdict=CaseVerdict.FAIL, detail=detail)
+        return CaseResult(
+            case_id=case.case_id,
+            verdict=CaseVerdict.FAIL,
+            detail=detail,
+            duration_ms=duration_ms,
+        )
 
 
-#: The pinned suite, run on the candidate tree inside the sandbox.
+#: The pinned suite, run on the candidate tree inside the sandbox. Its
+#: 1s pass floor is deliberate (P2 wall-clock cross-check): interpreter
+#: startup, dependency imports, and collection alone cost more than a
+#: second, so a sub-second "suite green" is fabricated or hollow (zero
+#: tests collected) — and the gate fails it closed.
 DEFAULT_SUITE = EvalCase(
     case_id="suite",
     command="python -m pytest -q -p no:cacheprovider",
     env={"PYTHONPATH": "src"},
+    min_pass_seconds=1.0,
 )
 
 
@@ -166,9 +223,8 @@ class CodeGate:
         try:
             return self._evaluate(candidate_patch, baseline_ref, claim, claimed_files, chosen)
         except Exception as exc:
-            reason = (
-                f"gate crashed, failing closed: {type(exc).__name__}: "
-                + sanitize_output(str(exc), max_chars=200)
+            reason = f"gate crashed, failing closed: {type(exc).__name__}: " + sanitize_output(
+                str(exc), max_chars=200
             )
             return GateVerdict(
                 allowed=False,
@@ -196,9 +252,7 @@ class CodeGate:
                 extract_baseline(self._repo_root, baseline_ref, candidate_tree)
                 apply_patch(candidate_patch, candidate_tree)
             except PatchRejected as exc:
-                return self._reject(
-                    GateStage.STAGING, f"patch rejected before staging: {exc}", []
-                )
+                return self._reject(GateStage.STAGING, f"patch rejected before staging: {exc}", [])
             except StagingError as exc:
                 return self._gate_error(exc)
 
@@ -264,7 +318,11 @@ class CodeGate:
                         candidate_outcomes,
                     )
             else:
-                changed = f"{len(flips)} case(s) changed behavior" if flips else "no case changed behavior"
+                changed = (
+                    f"{len(flips)} case(s) changed behavior"
+                    if flips
+                    else "no case changed behavior"
+                )
                 checks.append(
                     GateCheckResult(
                         stage=GateStage.DIFFERENTIAL,
@@ -287,7 +345,9 @@ class CodeGate:
                 GateCheckResult(
                     stage=GateStage.NEVER_WORSE,
                     passed=True,
-                    detail="no evaluated case regressed" if cases else "no evaluated cases configured",
+                    detail="no evaluated case regressed"
+                    if cases
+                    else "no evaluated cases configured",
                 )
             )
             return GateVerdict(
@@ -338,12 +398,8 @@ class CodeGate:
                 *checks,
                 GateCheckResult(stage=stage, passed=False, detail=reason),
             ],
-            baseline_outcomes=(
-                list(baseline_outcomes.values()) if baseline_outcomes else []
-            ),
-            candidate_outcomes=(
-                list(candidate_outcomes.values()) if candidate_outcomes else []
-            ),
+            baseline_outcomes=(list(baseline_outcomes.values()) if baseline_outcomes else []),
+            candidate_outcomes=(list(candidate_outcomes.values()) if candidate_outcomes else []),
         )
 
     @staticmethod

@@ -20,6 +20,7 @@ from evogine.gates.code_gate import (
     EvalCase,
     GateStage,
 )
+from evogine.gates.equivalence import CaseVerdict
 from evogine.sandbox.docker_runner import DockerSandbox
 
 pytestmark = pytest.mark.skipif(
@@ -86,9 +87,7 @@ def test_dns_is_blackholed() -> None:
 def test_host_environment_is_not_inherited(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("EVOGINE_PROBE_SECRET", "probe-secret-value-9f2c")
     sandbox = DockerSandbox()
-    result = sandbox.run(
-        "python -c \"import os, json; print(json.dumps(sorted(os.environ)))\""
-    )
+    result = sandbox.run('python -c "import os, json; print(json.dumps(sorted(os.environ)))"')
     assert result.exit_code == 0
     assert "EVOGINE_PROBE_SECRET" not in result.stdout
     combined = result.stdout + result.stderr
@@ -184,3 +183,31 @@ def test_seccomp_profile_keeps_python_runnable() -> None:
     result = sandbox.run("python -c \"import pydantic, yaml; print('ok')\"")
     assert result.exit_code == 0
     assert result.stdout.strip().endswith("ok")
+
+
+# --- wall-clock cross-check (P2: too-fast pass fails closed) ---
+
+
+def test_wall_clock_crosscheck_fails_closed_on_too_fast_pass(tmp_path: Path) -> None:
+    """A PASS arriving faster than the declared floor is a verifier failure."""
+    evaluator = DockerCaseEvaluator(DockerSandbox())
+    case = EvalCase(
+        case_id="instant",
+        command="python -c \"print('ok')\"",
+        min_pass_seconds=30.0,
+    )
+    result = evaluator.run_case("candidate", tmp_path, case)
+    assert result.verdict is CaseVerdict.FAIL
+    assert "wall-clock cross-check" in result.detail
+
+
+def test_wall_clock_crosscheck_passes_genuinely_timed_runs(tmp_path: Path) -> None:
+    """Runs costing more than the floor keep their earned PASS."""
+    evaluator = DockerCaseEvaluator(DockerSandbox())
+    case = EvalCase(
+        case_id="real-execution",
+        command="python -c \"import time; time.sleep(1.1); print('ok')\"",
+        min_pass_seconds=1.0,
+    )
+    result = evaluator.run_case("candidate", tmp_path, case)
+    assert result.verdict is CaseVerdict.PASS, result.detail

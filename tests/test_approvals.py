@@ -22,7 +22,8 @@ from evogine.gates.approvals import (
 from evogine.gates.materiality import Verdict
 from evogine.gates.memory_gate import MemoryGate
 from evogine.gates.replay import ReplayRun
-from evogine.gates.telemetry import DecisionLog, RunsEvidenceSink
+from evogine.gates.telemetry import DecisionLog, DecisionStage, RunsEvidenceSink
+from evogine.gates.trajectory import TrajectoryStore
 
 PROPOSAL_ID = "appr-prop-9"
 LEARNING_ID = "prop-9"
@@ -194,6 +195,70 @@ def test_approve_refuses_a_proposal_that_lost_its_evidence(
     # Nothing moved: the proposal is still pending, the record still a candidate.
     assert approvals.get(pending).state is ApprovalState.PENDING
     assert store.get(LEARNING_ID).status == "candidate"
+
+
+def test_review_composes_trajectory_capture_with_the_approval_boundary(
+    root: Path, record_factory
+) -> None:
+    """V2-6 x V2-8 composition, end to end.
+
+    A cleared review leaves a trajectory file, a pending approval
+    proposal, and exactly one PromotionDecision; the human approval
+    promotes with the evidence attached; the rejection never promotes.
+    """
+    store = Engine(root)
+    approvals = ApprovalLog(root)
+    log = DecisionLog(root)
+    gate = MemoryGate(
+        CLEARED_RUNNER,
+        log,
+        approvals,
+        evidence=RunsEvidenceSink(root),
+        trajectories=TrajectoryStore(root),
+    )
+
+    # Approve arc: a cleared review renders — it does not promote.
+    approved_record = store.propose(record_factory("prop-9"))
+    store.queue_replay(approved_record.id, ["cold-1", "warm-1"])
+    decision = gate.review(store.get(approved_record.id), ["cold-1", "warm-1"])
+
+    assert decision.promoted is False
+    assert decision.stage is DecisionStage.APPROVAL
+    assert decision.evidence_ref == "runs/gate/prop-9.json"
+    assert decision.trajectory_ref == "runs/trajectory/prop-9.json"
+    assert (root / "runs" / "trajectory" / "prop-9.json").is_file()
+    assert [d.learning_id for d in log.all()] == ["prop-9"]  # exactly one decision
+    trajectory = TrajectoryStore(root).read("prop-9")
+    assert [call.tool for call in trajectory.tool_calls()] == [
+        "replay_runner.run",
+        "replay_runner.run",
+        "evidence_sink.write",
+        "approvals.render",
+    ]
+    assert [proposal.proposal_id for proposal in approvals.pending()] == [PROPOSAL_ID]
+
+    promoted = approve_proposal(
+        store,
+        approvals,
+        PROPOSAL_ID,
+        decided_by="nihanth",
+        reason="replays convince me",
+    )
+    assert promoted.status == "promoted"
+    assert promoted.counterfactual.evidence == decision.evidence_ref
+    assert [record.id for record in store.retrieve("429 backoff")] == ["prop-9"]
+
+    # Reject arc: the same composition, and the refusal never promotes.
+    rejected_record = store.propose(record_factory("prop-10"))
+    store.queue_replay(rejected_record.id, ["cold-1", "warm-1"])
+    gate.review(store.get(rejected_record.id), ["cold-1", "warm-1"])
+    rejected = reject_proposal(
+        store, approvals, "appr-prop-10", decided_by="nihanth", reason="not convinced"
+    )
+
+    assert rejected.status == "dropped"
+    assert [record.id for record in store.retrieve("429 backoff")] == ["prop-9"]
+    assert (root / "runs" / "trajectory" / "prop-10.json").is_file()
 
 
 def test_review_twice_keeps_one_pending_proposal(

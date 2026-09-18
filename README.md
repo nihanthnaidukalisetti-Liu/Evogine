@@ -29,7 +29,8 @@ src/evogine/
 │   └── roles.py       # builder / verifier / reflector responsibilities
 ├── bench/
 │   ├── harness.py     # warm-vs-cold decay-pressure benchmark
-│   └── cases/         # benchmark cases (empty for now)
+│   ├── cases/         # the 10-case corpus with hidden host-side invariants
+│   └── replay.py      # replay schedule vocabulary (case × arm × repeat)
 ├── seeds/             # bootstrap learning records (empty for now)
 └── py.typed
 ```

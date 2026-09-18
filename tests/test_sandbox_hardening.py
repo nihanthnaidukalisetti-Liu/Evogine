@@ -1,5 +1,6 @@
 """Offline hardening units: env allowlist, output sanitization, runner behavior.
 
+
 No Docker daemon is needed — the runner is exercised through a fake client,
 so these tests run in the plain offline suite and verify the contract at the
 docker-py call boundary.
@@ -132,6 +133,7 @@ class FakeImages:
         if self.build_fails:
             raise RuntimeError("build exploded")
         self.built.append(tag)
+        self.last_fileobj = fileobj
 
 
 class FakeContainers:
@@ -147,9 +149,7 @@ class FakeContainers:
             for opt in security_opt:
                 if isinstance(opt, str) and opt.startswith("seccomp="):
                     profile = Path(opt.split("=", 1)[1])
-                    self._container.seccomp_profile_read = profile.read_text(
-                        encoding="utf-8"
-                    )
+                    self._container.seccomp_profile_read = profile.read_text(encoding="utf-8")
         if self.run_fails:
             raise RuntimeError("cannot start container")
         return self._container
@@ -176,9 +176,7 @@ def test_run_returns_sanitized_result(tmp_path: Path) -> None:
 
 def test_run_kills_containers_past_the_deadline() -> None:
     container = FakeContainer(statuses=["running"], exit_code=137)
-    sandbox = DockerSandbox(
-        config=SandboxConfig(timeout_seconds=0.4), client=FakeClient(container)
-    )
+    sandbox = DockerSandbox(config=SandboxConfig(timeout_seconds=0.4), client=FakeClient(container))
     result = sandbox.run("sleep 1000")
     assert result.timed_out is True
     assert result.exit_code == 124
@@ -200,6 +198,34 @@ def test_ensure_image_builds_once_then_reuses() -> None:
     tag = sandbox.ensure_image()
     assert sandbox.ensure_image() == tag
     assert client.images.built == [tag]
+
+
+def test_ensure_image_builds_from_bytesio_context() -> None:
+    """The build fileobj must be an ``io.BytesIO`` of the Dockerfile.
+
+    docker-py's ``mkbuildcontext`` packs a ``BytesIO`` into the build
+    context, but anything else goes through ``t.gettarinfo`` which reads
+    ``fileobj.name`` — raw bytes explode there (caught by the CI
+    docker-gated job, the first run that ever executed this path).
+    """
+    import io
+    import tarfile
+
+    client = FakeClient()
+    sandbox = DockerSandbox(client=client)
+    sandbox.ensure_image()
+
+    fileobj = client.images.last_fileobj
+    assert isinstance(fileobj, io.BytesIO)
+    assert fileobj.getvalue() == sandbox._config.dockerfile.encode("utf-8")
+
+    # Round-trip through the real docker-py context builder (client-side
+    # only, no daemon): the tar must contain the Dockerfile verbatim.
+    mkbuildcontext = pytest.importorskip("docker.utils.build").mkbuildcontext
+    context = mkbuildcontext(io.BytesIO(fileobj.getvalue()))
+    with tarfile.open(fileobj=context) as tar:
+        packed = tar.extractfile(tar.getmember("Dockerfile"))
+        assert packed is not None and packed.read() == fileobj.getvalue()
 
 
 def test_ensure_image_build_failure_raises_sandbox_error() -> None:

@@ -20,6 +20,7 @@ docker-py is imported lazily so the offline suite never needs it installed.
 from __future__ import annotations
 
 import contextlib
+import io
 import re
 import time
 from collections.abc import Mapping
@@ -35,6 +36,7 @@ from evogine.sandbox.seccomp import build_security_opts, load_profile_json, prof
 if TYPE_CHECKING:
     # docker-py ships no type stubs (import-untyped); its surface stays Any.
     from docker import DockerClient  # type: ignore[import-untyped]
+
 
 class SandboxError(RuntimeError):
     """The sandbox could not run the workload (infrastructure failure)."""
@@ -140,7 +142,7 @@ class DockerSandbox:
         except Exception:  # image absent → build it once
             try:
                 client.images.build(
-                    fileobj=self._config.dockerfile.encode(), tag=tag, rm=True
+                    fileobj=io.BytesIO(self._config.dockerfile.encode()), tag=tag, rm=True
                 )
             except Exception as exc:
                 raise SandboxError(
@@ -217,16 +219,10 @@ class DockerSandbox:
                     break
                 time.sleep(0.1)
             exit_code = (
-                124
-                if timed_out
-                else int(container.attrs.get("State", {}).get("ExitCode", 1))
+                124 if timed_out else int(container.attrs.get("State", {}).get("ExitCode", 1))
             )
-            raw_stdout = container.logs(stdout=True, stderr=False).decode(
-                "utf-8", "replace"
-            )
-            raw_stderr = container.logs(stdout=False, stderr=True).decode(
-                "utf-8", "replace"
-            )
+            raw_stdout = container.logs(stdout=True, stderr=False).decode("utf-8", "replace")
+            raw_stderr = container.logs(stdout=False, stderr=True).decode("utf-8", "replace")
         finally:
             # Best-effort cleanup, deliberately: the run's output is already
             # captured, and a leaked container is visible in `docker ps` but
@@ -235,10 +231,7 @@ class DockerSandbox:
             with contextlib.suppress(Exception):
                 container.remove(force=True)
 
-        truncated = (
-            len(raw_stdout) > cfg.output_max_chars
-            or len(raw_stderr) > cfg.output_max_chars
-        )
+        truncated = len(raw_stdout) > cfg.output_max_chars or len(raw_stderr) > cfg.output_max_chars
         return SandboxResult(
             exit_code=exit_code,
             stdout=sanitize_output(

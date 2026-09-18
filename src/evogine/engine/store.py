@@ -25,7 +25,13 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from evogine.engine.records import LearningRecord, MergedSource, RecordCounterfactual
+from evogine.engine.records import (
+    DecayConfig,
+    LearningRecord,
+    MergedSource,
+    RecordCounterfactual,
+    decayed_confidence,
+)
 
 # Ids become filenames under ``records/``: lock them to filesystem- and
 # git-safe characters so a malicious proposal can never traverse paths
@@ -53,7 +59,7 @@ class AuditEvent(BaseModel):
 
     seq: int = 0
     ts: datetime = Field(default_factory=_now)
-    event: Literal["propose", "queue_replay", "promote", "demote", "merge"]
+    event: Literal["propose", "queue_replay", "promote", "demote", "merge", "decay"]
     record_id: str
     from_status: str | None = None
     to_status: str
@@ -391,6 +397,60 @@ class Engine:
         )
         self._commit(f"merge: {duplicate_id} into {primary_id}")
         return survivor
+
+    # ------------------------------------------------------- v2: decay
+
+    def decay(
+        self,
+        config: DecayConfig | None = None,
+        now: datetime | None = None,
+    ) -> list[LearningRecord]:
+        """Apply configured confidence decay to every live record.
+
+        Confidence decays on the configured exponential half-life curve
+        with an asymptotic floor, anchored on each record's
+        ``confidence_updated_at`` (or ``created`` for records that never
+        carried it) so passes compose exactly and a re-run at the same
+        instant is a no-op. Records flagged ``evergreen`` are exempt:
+        safety-critical knowledge is never aged toward the floor, so it
+        can never decay below retrieval consideration. Terminal states
+        (``dropped``/``merged``) are frozen — they are history, not live
+        belief. Returns the records whose confidence actually moved; a
+        pass that changes nothing writes no audit events and no empty
+        commit.
+        """
+        curve = config or DecayConfig()
+        moment = now or _now()
+        decayed: list[LearningRecord] = []
+        for record in self._all_records():
+            if record.status not in _LIVE_STATUSES or record.evergreen:
+                continue
+            anchor = record.confidence_updated_at or record.created
+            new_confidence = decayed_confidence(
+                record.confidence, since=anchor, now=moment, config=curve
+            )
+            if new_confidence >= record.confidence:
+                continue
+            updated = record.model_copy(
+                update={"confidence": new_confidence, "confidence_updated_at": moment}
+            )
+            self._save(updated)
+            decayed.append(updated)
+            self._append_audit(
+                AuditEvent(
+                    event="decay",
+                    record_id=record.id,
+                    from_status=record.status,
+                    to_status=record.status,
+                    reason=(
+                        f"confidence {record.confidence:.4f} -> {new_confidence:.4f} "
+                        f"(half-life {curve.half_life_days}d, floor {curve.floor})"
+                    ),
+                )
+            )
+        if decayed:
+            self._commit(f"decay: {len(decayed)} record(s) aged past the curve")
+        return decayed
 
     # ----------------------------------------------------------- persistence
 

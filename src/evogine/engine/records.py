@@ -63,6 +63,43 @@ class MergedSource(BaseModel):
     merged_at: datetime
 
 
+class DecayConfig(BaseModel):
+    """Configuration for the V2-5 confidence-decay curve.
+
+    Exponential half-life decay with an asymptotic floor: confidence is
+    never pushed below ``floor``, so even fully-aged knowledge stays a
+    visible, auditable belief. ``half_life_days > 0`` keeps the curve
+    well-defined; ``floor < 1`` keeps decay a decay.
+    """
+
+    half_life_days: float = Field(default=30.0, gt=0.0)
+    floor: float = Field(default=0.05, ge=0.0, lt=1.0)
+
+
+def decayed_confidence(
+    confidence: float,
+    *,
+    since: datetime,
+    now: datetime,
+    config: DecayConfig,
+) -> float:
+    """Confidence after exponential half-life decay with an asymptotic floor.
+
+    ``floor + (confidence - floor) * 2 ** (-age / half_life)``: unchanged at
+    zero age, halved above the floor at one half-life, never below the
+    configured floor. Decay only lowers — a confidence already under the
+    floor is left alone rather than lifted back toward it, and a ``now``
+    before ``since`` changes nothing.
+    """
+    if now <= since:
+        return confidence
+    age_days = (now - since).total_seconds() / 86400
+    decayed = config.floor + (confidence - config.floor) * 2.0 ** (
+        -age_days / config.half_life_days
+    )
+    return min(confidence, decayed)
+
+
 class LearningRecord(BaseModel):
     """A versioned unit of engine knowledge.
 
@@ -90,6 +127,7 @@ class LearningRecord(BaseModel):
     merged_sources: list[MergedSource] = Field(default_factory=list)
     merged_into: str | None = None
     confidence_updated_at: datetime | None = None
+    evergreen: bool = False
 
     @classmethod
     def sample(cls) -> LearningRecord:

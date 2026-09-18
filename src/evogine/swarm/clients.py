@@ -10,6 +10,7 @@ role code or provider SDKs: providers make exactly one attempt, and
 
 from __future__ import annotations
 
+import math
 import random
 import time
 from collections.abc import Callable
@@ -122,7 +123,9 @@ class RetryingModelClient:
                 self._sleep(self._backoff_delay(attempts, exc.retry_after))
 
     def _backoff_delay(self, attempt: int, retry_after: float | None) -> float:
-        exponential = self._policy.initial_backoff_s * self._policy.multiplier ** (attempt - 1)
+        exponential = self._policy.initial_backoff_s * math.pow(
+            self._policy.multiplier, attempt - 1
+        )
         delay = min(exponential, self._policy.max_backoff_s)
         if retry_after is not None:
             delay = max(delay, min(retry_after, self._policy.max_backoff_s))

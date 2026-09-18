@@ -98,7 +98,14 @@ def paired_median_delta(baseline: list[Verdict], warm: list[Verdict]) -> float:
     The median, not the mean: a single large delta must not buy materiality
     that the typical case does not support.
     """
-    deltas = [warm_v.score - baseline_v.score for baseline_v, warm_v in align_verdicts(baseline, warm)]
+    deltas: list[float] = []
+    for baseline_v, warm_v in align_verdicts(baseline, warm):
+        if baseline_v.score is None or warm_v.score is None:
+            raise MaterialityError(
+                "scored deltas require a score on both arms for instance "
+                f"{baseline_v.instance_id!r}"
+            )
+        deltas.append(warm_v.score - baseline_v.score)
     return median(deltas)
 
 

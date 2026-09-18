@@ -36,6 +36,7 @@ from evogine.engine.records import (
 )
 from evogine.gates.code_gate import CodeGate
 from evogine.gates.memory_gate import MemoryGate
+from evogine.gates.telemetry import PromotionDecision
 from evogine.swarm.clients import ModelClient, ModelRequest
 from evogine.swarm.patches import apply_unified_diff
 
@@ -133,8 +134,10 @@ class Verifier:
         """Return the code gate's verdict on ``patch`` against ``baseline_ref``."""
         return self._code_gate.evaluate(patch.diff, baseline_ref)
 
-    def review_learning(self, record: LearningRecord, replay_run_ids: list[str]) -> bool:
-        """Return the memory gate's verdict on ``record``'s replay evidence."""
+    def review_learning(
+        self, record: LearningRecord, replay_run_ids: list[str]
+    ) -> PromotionDecision:
+        """Run the memory gate's review; return the recorded promotion decision."""
         return self._memory_gate.review(record, replay_run_ids)
 
 
@@ -242,3 +245,4 @@ def _new_learning_id() -> str:
 def _source_from_context(failure_context: str) -> str:
     """Collapse the failure context into a bounded provenance string."""
     return " ".join(failure_context.split())[:80]
+

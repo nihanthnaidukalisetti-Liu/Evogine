@@ -18,7 +18,8 @@ remains auditable, never deleted.
 
 from __future__ import annotations
 
-from evogine.engine.records import LearningRecord
+from evogine.engine.records import LearningRecord, RecordCounterfactual
+from evogine.engine.store import Engine
 from evogine.gates.materiality import (
     MaterialityError,
     align_verdicts,
@@ -174,3 +175,32 @@ class MemoryGate:
         return decision(
             DecisionStage.NEVER_WORSE, True, f"cleared: {materiality.detail}"
         ), evidence_payload
+
+
+def run_promotion_pass(engine: Engine, gate: MemoryGate) -> list[PromotionDecision]:
+    """Run the gate over every candidate in the store and apply the verdict.
+
+    Passing records are promoted with their replay evidence; knowledge-stage
+    rejections are demoted to ``dropped`` (auditable, never deleted);
+    gate errors leave the record a candidate — infrastructure failures say
+    nothing about the knowledge, so it stays eligible for a retry. Returns
+    one decision per decided proposal, in store order. Every decision is
+    already persisted in the gate's log: a decided proposal without a
+    decision record is a bug (V2-1 completeness invariant).
+    """
+    decisions: list[PromotionDecision] = []
+    for record in engine.candidates():
+        decision = gate.review(record, record.counterfactual.replay_run_ids)
+        if decision.promoted:
+            engine.promote(
+                record.id,
+                RecordCounterfactual(
+                    replay_run_ids=decision.replay_run_ids,
+                    verdict_change=True,
+                    evidence=decision.evidence_ref,
+                ),
+            )
+        elif decision.stage is not DecisionStage.GATE_ERROR:
+            engine.demote(record.id, decision.reason)
+        decisions.append(decision)
+    return decisions

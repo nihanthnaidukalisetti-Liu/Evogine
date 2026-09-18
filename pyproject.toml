@@ -38,6 +38,9 @@ target-version = "py312"
 # availability probe. Narrow catches are impossible without hard-importing
 # docker-py, which must stay optional at runtime.
 "src/evogine/sandbox/docker_runner.py" = ["BLE001", "S110"]
+# The code gate's fail-closed contract is a deliberate catch-all: ANY crash or
+# infrastructure failure must produce a rejection, never an acceptance.
+"src/evogine/gates/code_gate.py" = ["BLE001"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/evogine"]

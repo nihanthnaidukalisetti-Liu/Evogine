@@ -109,15 +109,18 @@ class LearningRecord(BaseModel):
     V2-5 extends the v1 lifecycle with new states without breaking the
     round-trip contract: ``merged`` marks a record absorbed into a
     duplicate-free survivor (``merged_into`` names it; body and provenance
-    stay verbatim), and the new v2 fields all default so v1 JSON validates
-    unchanged.
+    stay verbatim), and ``retired`` shelves a stale record reversibly —
+    ``retired_from`` remembers its prior status so reinstatement restores
+    it exactly. All new fields default, so v1 JSON validates unchanged.
     """
 
     id: str
     type: Literal["failure-pattern", "playbook", "check"]
     title: str
     body: RecordBody
-    status: Literal["ephemeral", "candidate", "promoted", "dropped", "merged"]
+    status: Literal[
+        "ephemeral", "candidate", "promoted", "dropped", "merged", "retired"
+    ]
     confidence: float = Field(ge=0.0, le=1.0)
     provenance: RecordProvenance
     counterfactual: RecordCounterfactual
@@ -128,6 +131,8 @@ class LearningRecord(BaseModel):
     merged_into: str | None = None
     confidence_updated_at: datetime | None = None
     evergreen: bool = False
+    retired_at: datetime | None = None
+    retired_from: str | None = None
 
     @classmethod
     def sample(cls) -> LearningRecord:

@@ -59,7 +59,9 @@ class AuditEvent(BaseModel):
 
     seq: int = 0
     ts: datetime = Field(default_factory=_now)
-    event: Literal["propose", "queue_replay", "promote", "demote", "merge", "decay"]
+    event: Literal[
+        "propose", "queue_replay", "promote", "demote", "merge", "decay", "retire", "reinstate"
+    ]
     record_id: str
     from_status: str | None = None
     to_status: str
@@ -451,6 +453,73 @@ class Engine:
         if decayed:
             self._commit(f"decay: {len(decayed)} record(s) aged past the curve")
         return decayed
+
+    # ------------------------------------------------------- v2: retire
+
+    def retire(self, learning_id: str, reason: str) -> LearningRecord:
+        """Move ``learning_id`` to the reversible ``retired`` state.
+
+        Staleness is not rejection: a retired record leaves retrieval
+        (promotion-only, and ``retired`` is not ``promoted``) but stays on
+        disk, readable, never deleted. ``retired_from`` remembers the prior
+        status and ``retired_at`` stamps the moment, so :meth:`reinstate`
+        can restore the record exactly. Live states only — ``dropped`` is
+        already a terminal rejection and ``merged`` a terminal absorption;
+        neither needs a second shelf.
+        """
+        if not reason.strip():
+            raise StoreError("retire requires a reason")
+        record = self._load(learning_id)
+        if record.status not in _LIVE_STATUSES:
+            raise StoreError(f"retire requires a live record; {learning_id} is {record.status}")
+        retired = record.model_copy(
+            update={"status": "retired", "retired_at": _now(), "retired_from": record.status}
+        )
+        self._save(retired)
+        self._append_audit(
+            AuditEvent(
+                event="retire",
+                record_id=learning_id,
+                from_status=record.status,
+                to_status="retired",
+                reason=reason,
+            )
+        )
+        self._commit(f"retire: {learning_id}")
+        return retired
+
+    def reinstate(self, learning_id: str) -> LearningRecord:
+        """Restore a retired record to exactly its pre-retirement state.
+
+        The reversibility half of the retirement contract: ``retired_from``
+        is restored verbatim and the retirement stamps are cleared, so a
+        reinstated record equals its pre-retirement self field-for-field.
+        The audit trail keeps both directions — history is never rewritten.
+        """
+        record = self._load(learning_id)
+        if record.status != "retired":
+            raise StoreError(
+                f"reinstate requires a retired record; {learning_id} is {record.status}"
+            )
+        restored = record.model_copy(
+            update={
+                "status": record.retired_from,
+                "retired_at": None,
+                "retired_from": None,
+            }
+        )
+        self._save(restored)
+        self._append_audit(
+            AuditEvent(
+                event="reinstate",
+                record_id=learning_id,
+                from_status="retired",
+                to_status=restored.status,
+                reason=f"reinstated from retirement (retired_from={record.retired_from})",
+            )
+        )
+        self._commit(f"reinstate: {learning_id}")
+        return restored
 
     # ----------------------------------------------------------- persistence
 

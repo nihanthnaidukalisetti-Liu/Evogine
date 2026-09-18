@@ -14,9 +14,11 @@ import pytest
 from evogine.sandbox.staging import (
     PatchRejected,
     StagingError,
+    _run_git,
     apply_patch,
     create_staging_root,
     extract_baseline,
+    initialize_staged_repo,
     validate_patch_paths,
     validate_relative_path,
 )
@@ -139,6 +141,30 @@ def test_extract_baseline_roundtrip(tmp_path: Path) -> None:
     assert not (dest / ".git").exists()
     apply_patch(ADD_FILE_PATCH, dest)  # git apply needs no repository
     assert (dest / "new_probe.py").exists()
+
+
+def test_initialize_staged_repo_creates_a_self_contained_head(tmp_path: Path) -> None:
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "src").mkdir()
+    (tree / "src" / "module.py").write_text("x = 1\n", encoding="utf-8")
+
+    initialize_staged_repo(tree)
+
+    assert _run_git(["rev-parse", "--verify", "HEAD"], cwd=tree).strip()
+    files = _run_git(["ls-files"], cwd=tree).decode("utf-8")
+    assert "src/module.py" in files
+    # Identity is pinned by -c flags on a hermetic git — the host's git config
+    # and identity must never reach the staged commit.
+    author = _run_git(["log", "-1", "--format=%an|%ae"], cwd=tree).decode("utf-8").strip()
+    assert author == "evogine-gate|gate@invalid"
+
+
+def test_initialize_staged_repo_fails_closed_on_an_empty_tree(tmp_path: Path) -> None:
+    tree = tmp_path / "empty"
+    tree.mkdir()
+    with pytest.raises(StagingError, match="commit failed"):
+        initialize_staged_repo(tree)
 
 
 def test_extract_baseline_rejects_bad_refs(tmp_path: Path) -> None:

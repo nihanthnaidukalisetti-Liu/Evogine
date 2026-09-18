@@ -37,6 +37,7 @@ from evogine.sandbox.staging import (
     apply_patch,
     create_staging_root,
     extract_baseline,
+    initialize_staged_repo,
     validate_relative_path,
 )
 
@@ -253,6 +254,15 @@ class CodeGate:
                 apply_patch(candidate_patch, candidate_tree)
             except PatchRejected as exc:
                 return self._reject(GateStage.STAGING, f"patch rejected before staging: {exc}", [])
+            except StagingError as exc:
+                return self._gate_error(exc)
+
+            # Staged trees become self-contained git repos (staging contract,
+            # amends PR #6): the in-container suite exercises git-backed paths
+            # against its repo root, and archive-extracted trees have no .git.
+            try:
+                initialize_staged_repo(baseline_tree)
+                initialize_staged_repo(candidate_tree)
             except StagingError as exc:
                 return self._gate_error(exc)
 

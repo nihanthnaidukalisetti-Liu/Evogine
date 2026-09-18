@@ -41,13 +41,17 @@ def validate_ref(baseline_ref: str) -> str:
 
 def validate_relative_path(path: str) -> str:
     """Reject absolute, parent-relative, and otherwise exotic paths."""
-    if (
-        not _SAFE_RELATIVE.fullmatch(path)
-        or ".." in path.split("/")
-        or path.endswith("/")
-    ):
+    if not _SAFE_RELATIVE.fullmatch(path) or ".." in path.split("/") or path.endswith("/"):
         raise PatchRejected(f"unsafe path in patch: {path[:100]!r}")
     return path
+
+
+def _git_subcommand(args: list[str]) -> str:
+    """The first non-flag subcommand — ``-c key=value`` pairs precede it."""
+    index = 0
+    while index + 1 < len(args) and args[index] == "-c":
+        index += 2
+    return args[index]
 
 
 def _run_git(args: list[str], *, cwd: Path | None = None) -> bytes:
@@ -70,10 +74,10 @@ def _run_git(args: list[str], *, cwd: Path | None = None) -> bytes:
     except FileNotFoundError as exc:
         raise StagingError("git is not available on the host") from exc
     except subprocess.TimeoutExpired as exc:
-        raise StagingError(f"git {args[0]} timed out") from exc
+        raise StagingError(f"git {_git_subcommand(args)} timed out") from exc
     if proc.returncode != 0:
         message = proc.stderr.decode("utf-8", "replace").strip()
-        raise StagingError(f"git {args[0]} failed: {message[:200]}")
+        raise StagingError(f"git {_git_subcommand(args)} failed: {message[:200]}")
     return proc.stdout
 
 
@@ -96,6 +100,34 @@ def extract_baseline(repo_root: Path, baseline_ref: str, dest: Path) -> Path:
     with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
         tar.extractall(dest, filter="data")
     return dest
+
+
+def initialize_staged_repo(tree: Path) -> None:
+    """Make a staged tree a self-contained git repository with a HEAD.
+
+    The gate container runs the candidate suite against an archive-extracted
+    tree, which has no ``.git`` — but the suite's own tests exercise
+    git-backed paths against their repo root. A fresh, identity-pinned init
+    makes every staged tree hermetic: no host refs, no host config, and no
+    host identity leaks into the tree or back out of it.
+    """
+    _run_git(["init", "-q", "-b", "main"], cwd=tree)
+    _run_git(["add", "-A"], cwd=tree)
+    _run_git(
+        [
+            "-c",
+            "user.name=evogine-gate",
+            "-c",
+            "user.email=gate@invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "evogine-gate staged tree",
+        ],
+        cwd=tree,
+    )
 
 
 def validate_patch_paths(patch: str) -> list[str]:

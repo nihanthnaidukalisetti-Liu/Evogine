@@ -10,6 +10,7 @@ exercise the traversal-safe staging path end to end.
 
 from __future__ import annotations
 
+import shutil
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -24,7 +25,14 @@ from evogine.gates.code_gate import (
     GateStage,
 )
 from evogine.gates.equivalence import differential_flips
-from evogine.sandbox.staging import PatchRejected, validate_patch_paths
+from evogine.sandbox.staging import (
+    PatchRejected,
+    apply_patch,
+    create_staging_root,
+    extract_baseline,
+    initialize_staged_repo,
+    validate_patch_paths,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -236,3 +244,43 @@ def test_coverage_mismatch_fails_closed() -> None:
 def test_patch_rejection_survives_as_typed_error() -> None:
     with pytest.raises(PatchRejected):
         validate_patch_paths("diff --git a/../x b/../x\n")
+
+
+class RepoProbeEvaluator(StubEvaluator):
+    """Refuses to run outside a self-contained staged repo (the contract)."""
+
+    def run_case(self, tree: str, staging: Path, case: EvalCase) -> CaseResult:
+        assert (staging / ".git").is_dir(), f"{tree} tree is not a staged repo"
+        return super().run_case(tree, staging, case)
+
+
+def test_gate_hands_the_evaluator_self_contained_repos() -> None:
+    """Both staged trees must be fresh git repos with a HEAD by eval time.
+
+    The in-container suite exercises git-backed paths against its repo root;
+    archive-extracted trees have none, so the gate stages them as repos
+    before any evaluator sees them.
+    """
+    evaluator = RepoProbeEvaluator(ALL_PASS, ALL_PASS)
+    verdict = make_gate(evaluator).evaluate_detailed(COMMENT_ONLY_PATCH, "HEAD")
+    assert verdict.allowed is True
+
+
+def test_bytecode_check_ignores_git_directories() -> None:
+    """Initializing a staged repo must not change the bytecode verdict."""
+    gate = make_gate(StubEvaluator(ALL_PASS, ALL_PASS))
+    root = create_staging_root()
+    try:
+        baseline = root / "b"
+        candidate = root / "c"
+        extract_baseline(REPO_ROOT, "HEAD", baseline)
+        extract_baseline(REPO_ROOT, "HEAD", candidate)
+        apply_patch(COMMENT_ONLY_PATCH, candidate)
+        claimed = ["src/evogine/__init__.py"]
+        without_git = gate._verify_bytecode(baseline, candidate, claimed)
+        initialize_staged_repo(baseline)
+        initialize_staged_repo(candidate)
+        with_git = gate._verify_bytecode(baseline, candidate, claimed)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    assert without_git == with_git == (True, "1 claimed file(s) bytecode-identical")

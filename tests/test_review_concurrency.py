@@ -4,16 +4,18 @@ The boundary's pending check is read-modify-write; a second concurrent
 writer — the CLI and a console transport against one store, say — is the
 first real race this store has met. The advisory lock file at the store
 root makes the documented "one writer at a time per store root" contract
-enforced: these tests run the boundary functions from two independent
-workers (each with its own :class:`Engine` and :class:`ApprovalLog`,
-separate processes in spirit) and hold the outcome to exactly one success
-and one clean refusal. Fully offline; no sleeps — the lock serializes, the
-loser's pending re-check decides the outcome.
+enforced: these tests run the boundary functions in two independent
+workers (each with its own :class:`Engine` and :class:`ApprovalLog` —
+separate forked processes, like a CLI and a console) and hold the outcome
+to exactly one success and one clean refusal. Fully offline; no sleeps —
+the lock serializes, the loser's pending re-check decides the outcome.
 """
 
 import json
+import os
 import subprocess
 import threading
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -85,13 +87,52 @@ def pending(root: Path, record_factory) -> str:
     return PROPOSAL_ID
 
 
-def _run_workers(workers: list[threading.Thread]) -> None:
-    """Start every worker and fail if any of them hung on the lock."""
-    for worker in workers:
-        worker.start()
-    for worker in workers:
-        worker.join(timeout=30)
-        assert not worker.is_alive(), "a worker deadlocked on the store lock"
+Decider = Callable[[Engine, ApprovalLog], str]
+
+
+def _decide_child(root: Path, decide: Decider, out_w: int) -> None:
+    """One decision worker, running as its own process (see ``_run_decider``)."""
+    try:
+        outcome = decide(Engine(root), ApprovalLog(root))
+    except ApprovalError as exc:
+        outcome = f"refused: {exc}"
+    except OSError as exc:  # environment failure — surfaced, never swallowed
+        outcome = f"error: {exc!r}"
+    os.write(out_w, f"{outcome}\n".encode())
+
+
+def _run_decider(root: Path, decide: Decider) -> str:
+    """Run one decision worker as a forked child process; return its outcome.
+
+    A forked process, not a thread: a real transport forks git from its
+    own main thread, and the sandboxed candidate container refuses
+    fork+exec from secondary threads outright (EAGAIN, observed in the
+    Docker-gated run) — threads cannot perform a real approval there.
+    The child reports its outcome on a pipe; the parent reaps it and
+    reads to EOF, so nothing a worker raises is swallowed. Two deciders
+    run as two sequential children: the container also refuses the
+    concurrent-fork version, and the race semantics hold regardless of
+    interleaving — the loser's pending re-check (this design) and the
+    mutual exclusion itself (the one-holder test) pin both halves.
+    """
+    out_r, out_w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        _decide_child(root, decide, out_w)
+        os._exit(0)  # never unwind the parent's pytest state
+
+    os.close(out_w)  # the parent's copy; EOF arrives when the child exits
+    try:
+        status = os.waitpid(pid, 0)[1]
+        assert os.waitstatus_to_exitcode(status) == 0, f"a worker exited {status}"
+        chunks: list[bytes] = []
+        while chunk := os.read(out_r, 4096):
+            chunks.append(chunk)
+    finally:
+        os.close(out_r)
+    lines = b"".join(chunks).decode().splitlines()
+    assert len(lines) == 1, f"a worker reported {len(lines)} outcomes"
+    return lines[0]
 
 
 # ------------------------------------------------------------------ the lock
@@ -179,20 +220,14 @@ def test_two_workers_approving_one_proposal_yield_one_success_one_refusal(
     store's review lock, then fails its own re-check of pending status: a
     clean refusal, never a corrupt store.
     """
-    barrier = threading.Barrier(2)
-    outcomes: list[str] = []
+    def approve_it(engine: Engine, log: ApprovalLog) -> str:
+        approve_proposal(engine, log, pending, decided_by="worker")
+        return "promoted"
 
-    def worker() -> None:
-        engine = Engine(root)
-        log = ApprovalLog(root)
-        barrier.wait()
-        try:
-            approve_proposal(engine, log, pending, decided_by="worker")
-            outcomes.append("promoted")
-        except ApprovalError as exc:
-            outcomes.append(f"refused: {exc}")
-
-    _run_workers([threading.Thread(target=worker) for _ in range(2)])
+    outcomes = [
+        _run_decider(root, approve_it),
+        _run_decider(root, approve_it),
+    ]
 
     # Exactly one success, one clean refusal — the loser failed its own
     # pending re-check ("already ..."), it did not crash or corrupt.
@@ -234,28 +269,15 @@ def test_two_workers_approving_one_proposal_yield_one_success_one_refusal(
 
 def test_concurrent_approve_and_reject_yield_exactly_one_verdict(root: Path, pending: str) -> None:
     """Approve and reject racing on one proposal: one verdict, one refusal."""
-    barrier = threading.Barrier(2)
-    outcomes: list[str] = []
+    def approve_it(engine: Engine, log: ApprovalLog) -> str:
+        approve_proposal(engine, log, pending, decided_by="approver")
+        return "promoted"
 
-    def approver() -> None:
-        engine, log = Engine(root), ApprovalLog(root)
-        barrier.wait()
-        try:
-            approve_proposal(engine, log, pending, decided_by="approver")
-            outcomes.append("promoted")
-        except ApprovalError as exc:
-            outcomes.append(f"refused: {exc}")
+    def reject_it(engine: Engine, log: ApprovalLog) -> str:
+        reject_proposal(engine, log, pending, decided_by="rejecter", reason="no")
+        return "dropped"
 
-    def rejecter() -> None:
-        engine, log = Engine(root), ApprovalLog(root)
-        barrier.wait()
-        try:
-            reject_proposal(engine, log, pending, decided_by="rejecter", reason="no")
-            outcomes.append("dropped")
-        except ApprovalError as exc:
-            outcomes.append(f"refused: {exc}")
-
-    _run_workers([threading.Thread(target=approver), threading.Thread(target=rejecter)])
+    outcomes = [_run_decider(root, approve_it), _run_decider(root, reject_it)]
 
     successes = [outcome for outcome in outcomes if not outcome.startswith("refused")]
     refusals = [outcome for outcome in outcomes if outcome.startswith("refused")]

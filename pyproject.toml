@@ -15,6 +15,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+docker = [
+    "docker>=7.1.0",
+]
 dev = [
     "pytest",
     "ruff",
@@ -28,6 +31,16 @@ evogine = "evogine.cli:main"
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+
+[tool.ruff.lint.per-file-ignores]
+# The Docker boundary deliberately catches broadly — every catch is converted
+# to a typed SandboxError/SandboxUnavailable (fail-closed) or is an
+# availability probe. Narrow catches are impossible without hard-importing
+# docker-py, which must stay optional at runtime.
+"src/evogine/sandbox/docker_runner.py" = ["BLE001", "S110"]
+# The code gate's fail-closed contract is a deliberate catch-all: ANY crash or
+# infrastructure failure must produce a rejection, never an acceptance.
+"src/evogine/gates/code_gate.py" = ["BLE001"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/evogine"]

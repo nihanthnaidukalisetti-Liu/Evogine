@@ -18,6 +18,12 @@ MODULES = [
     "evogine.bench.cases",
     "evogine.bench.harness",
     "evogine.bench.replay",
+    "evogine.sandbox",
+    "evogine.sandbox.config",
+    "evogine.sandbox.sanitize",
+    "evogine.sandbox.staging",
+    "evogine.sandbox.docker_runner",
+    "evogine.gates.equivalence",
 ]
 
 

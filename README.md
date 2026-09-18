@@ -18,7 +18,13 @@ src/evogine/
 │   └── store.py       # Engine: git-backed lifecycle, promotion-only retrieval
 ├── gates/
 │   ├── code_gate.py   # gate 1: sandboxed pytest + differential equivalence + never-worse
+│   ├── equivalence.py # pure gate logic: bytecode signatures, differential flips, never-worse
 │   └── memory_gate.py # gate 2: counterfactual replay promotion of learned knowledge
+├── sandbox/
+│   ├── config.py       # sandbox contract: pinned dependencies, CPU/memory/time caps
+│   ├── docker_runner.py # Docker execution sandbox: no network, sanitized output
+│   ├── sanitize.py     # output redaction/capping before it can influence a verdict
+│   └── staging.py      # path-traversal-safe baseline/candidate staging
 ├── swarm/
 │   └── roles.py       # builder / verifier / reflector responsibilities
 ├── bench/
@@ -31,8 +37,13 @@ src/evogine/
 
 ## Status
 
-v1 scaffold: contract-stable skeletons only — pydantic record model, stub engine and
-gates, tests, and CI. No engine logic yet.
+The sandboxed code gate is implemented: candidate patches are staged
+traversal-safe, verified inside a locked-down Docker container (no network,
+pinned dependencies, capped resources, sanitized output, no inherited host
+environment), checked for differential equivalence (bytecode-verified when a
+refactor claim is made), and enforced never-worse across evaluated cases. The
+gate fails closed on its own crash, and Docker-gated probes skip cleanly where
+Docker is absent. Everything else remains v1 scaffold skeletons.
 
 ## Spec
 

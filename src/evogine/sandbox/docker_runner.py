@@ -7,6 +7,9 @@ Execution posture (security review C1/H1, carried into V2):
 - Read-only root filesystem; writable ``/tmp`` is a size-capped tmpfs.
 - No capabilities (``cap_drop=ALL``), ``no-new-privileges``, PID limit,
   memory cap, CPU quota, non-root user, and a host-side wall-clock kill.
+- A deny-by-default seccomp profile, always on (P2): the vendored default
+  (:mod:`evogine.sandbox.seccomp`) replaces whatever the host daemon would
+  apply, so the guarantee does not depend on daemon configuration.
 - The container environment is BUILT from runner defaults plus an explicit
   allowlist — host ``os.environ`` is never forwarded (review H1).
 - Container output leaves the sandbox only through :func:`sanitize_output`.
@@ -17,6 +20,7 @@ docker-py is imported lazily so the offline suite never needs it installed.
 from __future__ import annotations
 
 import contextlib
+import io
 import re
 import time
 from collections.abc import Mapping
@@ -27,10 +31,12 @@ from pydantic import BaseModel
 
 from evogine.sandbox.config import SandboxConfig
 from evogine.sandbox.sanitize import sanitize_output
+from evogine.sandbox.seccomp import build_security_opts, load_profile_json
 
 if TYPE_CHECKING:
     # docker-py ships no type stubs (import-untyped); its surface stays Any.
     from docker import DockerClient  # type: ignore[import-untyped]
+
 
 class SandboxError(RuntimeError):
     """The sandbox could not run the workload (infrastructure failure)."""
@@ -136,7 +142,7 @@ class DockerSandbox:
         except Exception:  # image absent → build it once
             try:
                 client.images.build(
-                    fileobj=self._config.dockerfile.encode(), tag=tag, rm=True
+                    fileobj=io.BytesIO(self._config.dockerfile.encode()), tag=tag, rm=True
                 )
             except Exception as exc:
                 raise SandboxError(
@@ -171,6 +177,11 @@ class DockerSandbox:
             redactions[str(staging_dir)] = "<staging>"
 
         started = time.monotonic()
+        # Seccomp is default-on and passed inline: Engine 25+ decodes the
+        # security-opt value directly and rejects profile paths at start.
+        # A profile that fails validation raises before any container exists
+        # (fail-closed).
+        security_opt = build_security_opts(load_profile_json(cfg.seccomp_profile_json))
         try:
             container = client.containers.run(
                 image,
@@ -186,7 +197,7 @@ class DockerSandbox:
                 read_only=True,
                 tmpfs={"/tmp": f"size={cfg.tmpfs_size},mode=1777"},
                 cap_drop=["ALL"],
-                security_opt=["no-new-privileges:true"],
+                security_opt=security_opt,
                 volumes=volumes,
             )
         except Exception as exc:
@@ -209,16 +220,10 @@ class DockerSandbox:
                     break
                 time.sleep(0.1)
             exit_code = (
-                124
-                if timed_out
-                else int(container.attrs.get("State", {}).get("ExitCode", 1))
+                124 if timed_out else int(container.attrs.get("State", {}).get("ExitCode", 1))
             )
-            raw_stdout = container.logs(stdout=True, stderr=False).decode(
-                "utf-8", "replace"
-            )
-            raw_stderr = container.logs(stdout=False, stderr=True).decode(
-                "utf-8", "replace"
-            )
+            raw_stdout = container.logs(stdout=True, stderr=False).decode("utf-8", "replace")
+            raw_stderr = container.logs(stdout=False, stderr=True).decode("utf-8", "replace")
         finally:
             # Best-effort cleanup, deliberately: the run's output is already
             # captured, and a leaked container is visible in `docker ps` but
@@ -227,10 +232,7 @@ class DockerSandbox:
             with contextlib.suppress(Exception):
                 container.remove(force=True)
 
-        truncated = (
-            len(raw_stdout) > cfg.output_max_chars
-            or len(raw_stderr) > cfg.output_max_chars
-        )
+        truncated = len(raw_stdout) > cfg.output_max_chars or len(raw_stderr) > cfg.output_max_chars
         return SandboxResult(
             exit_code=exit_code,
             stdout=sanitize_output(

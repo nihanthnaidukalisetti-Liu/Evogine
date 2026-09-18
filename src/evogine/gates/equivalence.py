@@ -30,6 +30,10 @@ class CaseResult(BaseModel):
     case_id: str
     verdict: CaseVerdict
     detail: str = ""
+    # Wall-clock cost of the run, when the evaluator measured one. Feeds the
+    # verifier's too-fast-pass cross-check (see gates/wallclock.py); absent
+    # only for evaluators that never measured time.
+    duration_ms: float | None = None
 
 
 def _render_const(value: object) -> str:
@@ -105,9 +109,6 @@ def never_worse_regression(
     """
     _require_same_cases(baseline, candidate)
     for case_id, result in baseline.items():
-        if (
-            result.verdict is CaseVerdict.PASS
-            and candidate[case_id].verdict is CaseVerdict.FAIL
-        ):
+        if result.verdict is CaseVerdict.PASS and candidate[case_id].verdict is CaseVerdict.FAIL:
             return candidate[case_id]
     return None

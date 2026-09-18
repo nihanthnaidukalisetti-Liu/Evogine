@@ -20,6 +20,7 @@ from evogine.gates.code_gate import (
     EvalCase,
     GateStage,
 )
+from evogine.gates.equivalence import CaseVerdict
 from evogine.sandbox.docker_runner import DockerSandbox
 
 pytestmark = pytest.mark.skipif(
@@ -86,9 +87,7 @@ def test_dns_is_blackholed() -> None:
 def test_host_environment_is_not_inherited(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("EVOGINE_PROBE_SECRET", "probe-secret-value-9f2c")
     sandbox = DockerSandbox()
-    result = sandbox.run(
-        "python -c \"import os, json; print(json.dumps(sorted(os.environ)))\""
-    )
+    result = sandbox.run('python -c "import os, json; print(json.dumps(sorted(os.environ)))"')
     assert result.exit_code == 0
     assert "EVOGINE_PROBE_SECRET" not in result.stdout
     combined = result.stdout + result.stderr
@@ -141,3 +140,74 @@ def test_gate_rejects_broken_patch_through_real_sandbox() -> None:
     verdict = gate.evaluate_detailed(BREAKING_PATCH, "HEAD")
     assert verdict.allowed is False
     assert verdict.stage is GateStage.PYTEST
+
+
+# --- seccomp probes (P2: default-on profile) ---
+#
+# The runner passes a deny-by-default profile on every run (pinned by the
+# offline boundary test in test_seccomp.py); these probes verify the profile
+# is actually enforced inside the real container: syscalls the profile
+# denies get EPERM, and ordinary Python keeps working under the filter.
+
+#: keyctl has no glibc wrapper and its number differs per architecture.
+SECCOMP_PROBE = """import ctypes
+import platform
+
+libc = ctypes.CDLL(None, use_errno=True)
+results = []
+# unshare(CLONE_NEWUSER): the profile allows it only with CAP_SYS_ADMIN,
+# which the sandbox drops — must be denied.
+results.append(("unshare", libc.unshare(0x10000000)))
+# keyctl(GET_KEYRING_ID): denied outright by the profile; on an unfiltered
+# container this call succeeds (session keyring lookup).
+nr_keyctl = {"x86_64": 250, "aarch64": 270}[platform.machine()]
+results.append(("keyctl", libc.syscall(nr_keyctl, 0, 0, 0, 0, 0)))
+for name, rc in results:
+    print(f"{name}={rc}")
+"""
+
+
+def test_seccomp_denies_namespace_and_key_syscalls(tmp_path: Path) -> None:
+    staging = tmp_path / "probe"
+    staging.mkdir()
+    (staging / "probe.py").write_text(SECCOMP_PROBE, encoding="utf-8")
+    sandbox = DockerSandbox()
+    result = sandbox.run("python /workspace/probe.py", staging_dir=staging)
+    assert result.exit_code == 0, result.stderr
+    assert "unshare=-1" in result.stdout, result.stdout
+    assert "keyctl=-1" in result.stdout, result.stdout
+
+
+def test_seccomp_profile_keeps_python_runnable() -> None:
+    sandbox = DockerSandbox()
+    result = sandbox.run("python -c \"import pydantic, yaml; print('ok')\"")
+    assert result.exit_code == 0
+    assert result.stdout.strip().endswith("ok")
+
+
+# --- wall-clock cross-check (P2: too-fast pass fails closed) ---
+
+
+def test_wall_clock_crosscheck_fails_closed_on_too_fast_pass(tmp_path: Path) -> None:
+    """A PASS arriving faster than the declared floor is a verifier failure."""
+    evaluator = DockerCaseEvaluator(DockerSandbox())
+    case = EvalCase(
+        case_id="instant",
+        command="python -c \"print('ok')\"",
+        min_pass_seconds=30.0,
+    )
+    result = evaluator.run_case("candidate", tmp_path, case)
+    assert result.verdict is CaseVerdict.FAIL
+    assert "wall-clock cross-check" in result.detail
+
+
+def test_wall_clock_crosscheck_passes_genuinely_timed_runs(tmp_path: Path) -> None:
+    """Runs costing more than the floor keep their earned PASS."""
+    evaluator = DockerCaseEvaluator(DockerSandbox())
+    case = EvalCase(
+        case_id="real-execution",
+        command="python -c \"import time; time.sleep(1.1); print('ok')\"",
+        min_pass_seconds=1.0,
+    )
+    result = evaluator.run_case("candidate", tmp_path, case)
+    assert result.verdict is CaseVerdict.PASS, result.detail

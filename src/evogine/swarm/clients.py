@@ -9,8 +9,13 @@ than in role code or provider SDKs: providers make exactly one attempt.
 
 from __future__ import annotations
 
+import random
+import time
+from collections.abc import Callable
 from typing import Protocol
 
+import anthropic
+from anthropic.types import TextBlock
 from pydantic import BaseModel, Field
 
 
@@ -62,3 +67,136 @@ class ModelClient(Protocol):
     def complete(self, request: ModelRequest) -> ModelResponse:
         """Return the model's completion for ``request``."""
         ...
+
+
+class Jitter(Protocol):
+    """Source of backoff jitter; :class:`random.Random` satisfies it."""
+
+    def uniform(self, a: float, b: float) -> float:
+        """Return a random float in ``[a, b]``."""
+        ...
+
+
+class RetryPolicy(BaseModel):
+    """Bounded, jittered exponential backoff for transient model failures."""
+
+    max_attempts: int = Field(default=4, ge=1, description="1 means never retry")
+    initial_backoff_s: float = Field(default=0.5, gt=0)
+    max_backoff_s: float = Field(default=8.0, gt=0)
+    multiplier: float = Field(default=2.0, ge=1.0)
+
+
+class RetryingModelClient:
+    """A :class:`ModelClient` wrapping one single-attempt provider.
+
+    Retries only :class:`ModelTransientError`; permanent failures and
+    anything unexpected surface immediately. Backoff grows exponentially
+    from ``initial_backoff_s`` up to ``max_backoff_s`` and is fully jittered
+    (uniform in ``[0, computed]``) — unjittered retries amplify rate-limit
+    pressure into storms. A server ``Retry-After`` hint in whole seconds
+    raises the pre-jitter floor, capped by ``max_backoff_s``.
+    """
+
+    def __init__(
+        self,
+        provider: ModelClient,
+        policy: RetryPolicy | None = None,
+        *,
+        sleep: Callable[[float], None] = time.sleep,
+        jitter: Jitter | None = None,
+    ) -> None:
+        self._provider = provider
+        self._policy = policy or RetryPolicy()
+        self._sleep = sleep
+        self._jitter = jitter or random.Random()
+
+    def complete(self, request: ModelRequest) -> ModelResponse:
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                return self._provider.complete(request)
+            except ModelTransientError as exc:
+                if attempts >= self._policy.max_attempts:
+                    raise
+                self._sleep(self._backoff_delay(attempts, exc.retry_after))
+
+    def _backoff_delay(self, attempt: int, retry_after: float | None) -> float:
+        exponential = self._policy.initial_backoff_s * self._policy.multiplier ** (attempt - 1)
+        delay = min(exponential, self._policy.max_backoff_s)
+        if retry_after is not None:
+            delay = max(delay, min(retry_after, self._policy.max_backoff_s))
+        return self._jitter.uniform(0.0, delay)
+
+
+class AnthropicClient:
+    """Concrete provider: the Anthropic-compatible Messages API.
+
+    One concrete provider behind the P2 seam. SDK-level retries are disabled
+    (``max_retries=0``) — :class:`RetryingModelClient` owns resilience — and
+    SDK failures map onto the seam's error types so callers never see
+    provider exceptions: timeouts, connection errors, 429s, and 5xx are
+    transient; other 4xx (bad request, auth, not found, unprocessable) are
+    permanent.
+    """
+
+    def __init__(
+        self,
+        *,
+        model: str,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        timeout_s: float = 30.0,
+    ) -> None:
+        self._model = model
+        self._sdk = anthropic.Anthropic(
+            api_key=api_key, base_url=base_url, timeout=timeout_s, max_retries=0
+        )
+
+    def complete(self, request: ModelRequest) -> ModelResponse:
+        try:
+            message = self._sdk.messages.create(
+                model=self._model,
+                system=request.system,
+                messages=[{"role": "user", "content": request.user}],
+                max_tokens=request.max_tokens,
+                temperature=request.temperature,
+            )
+        except anthropic.APITimeoutError as exc:  # before APIConnectionError: subclass
+            raise ModelTransientError(f"model request timed out: {exc}") from exc
+        except anthropic.APIConnectionError as exc:
+            raise ModelTransientError(f"model connection failed: {exc}") from exc
+        except anthropic.RateLimitError as exc:
+            raise ModelTransientError(
+                "model rate limited", retry_after=_retry_after_seconds(exc)
+            ) from exc
+        except anthropic.InternalServerError as exc:
+            raise ModelTransientError(f"model server error: {exc}") from exc
+        except anthropic.APIStatusError as exc:
+            raise ModelPermanentError(f"model rejected the request: {exc}") from exc
+        return ModelResponse(
+            text="".join(
+                block.text for block in message.content if isinstance(block, TextBlock)
+            ),
+            stop_reason=message.stop_reason,
+            model=message.model,
+            input_tokens=message.usage.input_tokens,
+            output_tokens=message.usage.output_tokens,
+        )
+
+
+def _retry_after_seconds(exc: anthropic.RateLimitError) -> float | None:
+    """Whole-second ``Retry-After`` header, if present and parseable.
+
+    HTTP-date form is ignored: bounded jittered backoff covers it.
+    """
+    response = exc.response
+    if response is None:
+        return None
+    raw = response.headers.get("retry-after")
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None

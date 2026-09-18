@@ -27,3 +27,24 @@ jobs:
 
       - name: Pytest
         run: pytest -q
+
+  # The offline job above never installs docker-py, so the Docker-gated
+  # probes skip there. This job runs the same suite where the daemon exists
+  # (ubuntu-latest runners have Docker): the sandbox's isolation and
+  # seccomp guarantees are enforced for real, not just locally.
+  docker-gated:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install package with dev and docker dependencies
+        run: pip install -e ".[dev,docker]"
+
+      - name: Pytest with Docker probes active
+        run: pytest -q

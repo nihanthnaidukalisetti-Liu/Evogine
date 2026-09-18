@@ -37,6 +37,11 @@ class SandboxConfig(BaseModel):
     # Run as nobody:nogroup — the container is never root.
     container_user: str = "65534:65534"
     container_workspace: str = "/workspace"
+    # P2: seccomp is default-on and has no off switch. ``None`` selects the
+    # vendored deny-by-default profile (see sandbox/seccomp.py); a non-None
+    # value swaps in a custom profile — which must itself deny by default —
+    # but can never disable syscall filtering.
+    seccomp_profile_json: str | None = None
 
     @property
     def image_tag(self) -> str:

@@ -97,6 +97,10 @@ class FakeContainer:
         self.status = "created"
         self.kill_count = 0
         self.remove_count = 0
+        # Content of any seccomp profile passed at container creation — the
+        # seccomp tests snapshot it here, because the runner removes the
+        # profile file once the daemon has consumed it.
+        self.seccomp_profile_read: str | None = None
 
     def reload(self) -> None:
         if self._statuses:
@@ -134,8 +138,18 @@ class FakeContainers:
     def __init__(self, container: FakeContainer) -> None:
         self._container = container
         self.run_fails = False
+        self.last_kwargs: dict[str, object] = {}
 
     def run(self, *args: object, **kwargs: object) -> FakeContainer:
+        self.last_kwargs = kwargs
+        security_opt = kwargs.get("security_opt")
+        if isinstance(security_opt, list):
+            for opt in security_opt:
+                if isinstance(opt, str) and opt.startswith("seccomp="):
+                    profile = Path(opt.split("=", 1)[1])
+                    self._container.seccomp_profile_read = profile.read_text(
+                        encoding="utf-8"
+                    )
         if self.run_fails:
             raise RuntimeError("cannot start container")
         return self._container

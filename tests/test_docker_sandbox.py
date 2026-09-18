@@ -141,3 +141,46 @@ def test_gate_rejects_broken_patch_through_real_sandbox() -> None:
     verdict = gate.evaluate_detailed(BREAKING_PATCH, "HEAD")
     assert verdict.allowed is False
     assert verdict.stage is GateStage.PYTEST
+
+
+# --- seccomp probes (P2: default-on profile) ---
+#
+# The runner passes a deny-by-default profile on every run (pinned by the
+# offline boundary test in test_seccomp.py); these probes verify the profile
+# is actually enforced inside the real container: syscalls the profile
+# denies get EPERM, and ordinary Python keeps working under the filter.
+
+#: keyctl has no glibc wrapper and its number differs per architecture.
+SECCOMP_PROBE = """import ctypes
+import platform
+
+libc = ctypes.CDLL(None, use_errno=True)
+results = []
+# unshare(CLONE_NEWUSER): the profile allows it only with CAP_SYS_ADMIN,
+# which the sandbox drops — must be denied.
+results.append(("unshare", libc.unshare(0x10000000)))
+# keyctl(GET_KEYRING_ID): denied outright by the profile; on an unfiltered
+# container this call succeeds (session keyring lookup).
+nr_keyctl = {"x86_64": 250, "aarch64": 270}[platform.machine()]
+results.append(("keyctl", libc.syscall(nr_keyctl, 0, 0, 0, 0, 0)))
+for name, rc in results:
+    print(f"{name}={rc}")
+"""
+
+
+def test_seccomp_denies_namespace_and_key_syscalls(tmp_path: Path) -> None:
+    staging = tmp_path / "probe"
+    staging.mkdir()
+    (staging / "probe.py").write_text(SECCOMP_PROBE, encoding="utf-8")
+    sandbox = DockerSandbox()
+    result = sandbox.run("python /workspace/probe.py", staging_dir=staging)
+    assert result.exit_code == 0, result.stderr
+    assert "unshare=-1" in result.stdout, result.stdout
+    assert "keyctl=-1" in result.stdout, result.stdout
+
+
+def test_seccomp_profile_keeps_python_runnable() -> None:
+    sandbox = DockerSandbox()
+    result = sandbox.run("python -c \"import pydantic, yaml; print('ok')\"")
+    assert result.exit_code == 0
+    assert result.stdout.strip().endswith("ok")

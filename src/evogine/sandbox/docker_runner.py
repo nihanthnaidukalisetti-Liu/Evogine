@@ -7,6 +7,9 @@ Execution posture (security review C1/H1, carried into V2):
 - Read-only root filesystem; writable ``/tmp`` is a size-capped tmpfs.
 - No capabilities (``cap_drop=ALL``), ``no-new-privileges``, PID limit,
   memory cap, CPU quota, non-root user, and a host-side wall-clock kill.
+- A deny-by-default seccomp profile, always on (P2): the vendored default
+  (:mod:`evogine.sandbox.seccomp`) replaces whatever the host daemon would
+  apply, so the guarantee does not depend on daemon configuration.
 - The container environment is BUILT from runner defaults plus an explicit
   allowlist — host ``os.environ`` is never forwarded (review H1).
 - Container output leaves the sandbox only through :func:`sanitize_output`.
@@ -27,6 +30,7 @@ from pydantic import BaseModel
 
 from evogine.sandbox.config import SandboxConfig
 from evogine.sandbox.sanitize import sanitize_output
+from evogine.sandbox.seccomp import build_security_opts, load_profile_json, profile_file
 
 if TYPE_CHECKING:
     # docker-py ships no type stubs (import-untyped); its surface stays Any.
@@ -171,28 +175,32 @@ class DockerSandbox:
             redactions[str(staging_dir)] = "<staging>"
 
         started = time.monotonic()
-        try:
-            container = client.containers.run(
-                image,
-                command,
-                detach=True,
-                user=cfg.container_user,
-                working_dir=wd,
-                environment=build_container_env(env or {}),
-                mem_limit=f"{cfg.memory_mb}m",
-                nano_cpus=int(cfg.cpus * 1_000_000_000),
-                pids_limit=cfg.pids_limit,
-                network_mode="none",
-                read_only=True,
-                tmpfs={"/tmp": f"size={cfg.tmpfs_size},mode=1777"},
-                cap_drop=["ALL"],
-                security_opt=["no-new-privileges:true"],
-                volumes=volumes,
-            )
-        except Exception as exc:
-            raise SandboxError(
-                f"container start failed: {sanitize_output(str(exc), max_chars=300)}"
-            ) from exc
+        # The seccomp profile is consumed by the daemon at container creation;
+        # the file lives exactly that long. A profile that fails to validate
+        # or write raises before any container exists (fail-closed).
+        with profile_file(load_profile_json(cfg.seccomp_profile_json)) as profile_path:
+            try:
+                container = client.containers.run(
+                    image,
+                    command,
+                    detach=True,
+                    user=cfg.container_user,
+                    working_dir=wd,
+                    environment=build_container_env(env or {}),
+                    mem_limit=f"{cfg.memory_mb}m",
+                    nano_cpus=int(cfg.cpus * 1_000_000_000),
+                    pids_limit=cfg.pids_limit,
+                    network_mode="none",
+                    read_only=True,
+                    tmpfs={"/tmp": f"size={cfg.tmpfs_size},mode=1777"},
+                    cap_drop=["ALL"],
+                    security_opt=build_security_opts(str(profile_path)),
+                    volumes=volumes,
+                )
+            except Exception as exc:
+                raise SandboxError(
+                    f"container start failed: {sanitize_output(str(exc), max_chars=300)}"
+                ) from exc
 
         timed_out = False
         exit_code = 1

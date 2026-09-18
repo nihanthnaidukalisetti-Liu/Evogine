@@ -34,6 +34,7 @@ from evogine.gates.telemetry import (
     RunsEvidenceSink,
     check_reason,
 )
+from evogine.gates.trajectory import TrajectoryRecorder, TrajectoryStore
 
 
 class MemoryGate:
@@ -43,7 +44,10 @@ class MemoryGate:
     decision per review (the V2-1 completeness invariant lives here — a
     verdict that is not recorded never leaves the gate); ``evidence``, when
     given, persists the paired verdicts and the decision's ``evidence_ref``
-    points into ``runs/``.
+    points into ``runs/``; ``trajectories``, when given, persists the full
+    review trajectory (tool calls included) per decision and stamps its
+    store-relative path on the decision's ``trajectory_ref`` (V2-8) — the
+    verdict plus the reconstructible path to it.
     """
 
     def __init__(
@@ -52,11 +56,13 @@ class MemoryGate:
         log: DecisionLog,
         evidence: RunsEvidenceSink | None = None,
         scored_threshold: float = 0.15,
+        trajectories: TrajectoryStore | None = None,
     ) -> None:
         self._runner = runner
         self._log = log
         self._evidence = evidence
         self._scored_threshold = scored_threshold
+        self._trajectories = trajectories
 
     def review(
         self, record: LearningRecord, replay_run_ids: list[str]
@@ -67,15 +73,27 @@ class MemoryGate:
         ids attached by ``Engine.queue_replay``). The returned
         :class:`PromotionDecision` is already persisted in the log.
         """
-        decision, evidence_payload = self._decide(record, replay_run_ids)
+        trajectory = TrajectoryRecorder(gate="memory_gate", proposal_id=record.id)
+        decision, evidence_payload = self._decide(record, replay_run_ids, trajectory)
         if self._evidence is not None and evidence_payload is not None:
             evidence_ref = self._evidence.write(record.id, evidence_payload)
             decision = decision.model_copy(update={"evidence_ref": evidence_ref})
+            trajectory.tool_call(
+                "evidence_sink.write",
+                {"proposal_id": record.id},
+                result=f"wrote {evidence_ref}",
+            )
+        if self._trajectories is not None:
+            trajectory_ref = self._trajectories.write(record.id, trajectory.freeze())
+            decision = decision.model_copy(update={"trajectory_ref": trajectory_ref})
         self._log.record(decision)
         return decision
 
     def _decide(
-        self, record: LearningRecord, replay_run_ids: list[str]
+        self,
+        record: LearningRecord,
+        replay_run_ids: list[str],
+        trajectory: TrajectoryRecorder,
     ) -> tuple[PromotionDecision, dict[str, object] | None]:
         """Run the stage pipeline; return the decision plus evidence payload."""
 
@@ -85,6 +103,7 @@ class MemoryGate:
             # Internal consistency: gate builders must emit the vocabulary
             # the log enforces — a drifted reason fails here, not in the report.
             check_reason(stage, reason)
+            trajectory.decide(stage.value, promoted=promoted, reason=reason)
             return PromotionDecision(
                 proposal_id=record.id,
                 learning_id=record.id,
@@ -102,15 +121,26 @@ class MemoryGate:
         runs = []
         for run_id in replay_run_ids:
             try:
-                runs.append(self._runner.run(run_id))
+                run = self._runner.run(run_id)
             except Exception as exc:  # noqa: BLE001 — fail-closed gate boundary: any
                 # infrastructure failure is a GATE_ERROR verdict, never a crash and
                 # never a knowledge verdict (documented per-file exception).
+                trajectory.tool_call(
+                    "replay_runner.run",
+                    {"run_id": run_id},
+                    result=f"failed: {exc}",
+                )
                 return decision(
                     DecisionStage.GATE_ERROR,
                     False,
                     f"gate_error: replay run {run_id} failed: {exc}",
                 ), None
+            trajectory.tool_call(
+                "replay_runner.run",
+                {"run_id": run_id},
+                result=f"{run.arm}: {len(run.verdicts)} verdict(s)",
+            )
+            runs.append(run)
 
         baseline = [v for run in runs if run.arm == "baseline" for v in run.verdicts]
         warm = [v for run in runs if run.arm == "warm" for v in run.verdicts]

@@ -58,6 +58,10 @@ class PromotionDecision(BaseModel):
     reason: str
     replay_run_ids: list[str] = Field(default_factory=list)
     evidence_ref: str | None = None
+    trajectory_ref: str | None = None
+    """V2-8 anti-gaming: store-relative path to the decision's trajectory
+    file (tool calls included), set when trajectory capture is wired — the
+    full path to this verdict, not just the verdict."""
 
 
 class TelemetryError(ValueError):
@@ -112,6 +116,10 @@ def check_reason(stage: DecisionStage, reason: str) -> None:
 # and evidence files are named by proposal id, so a hostile id must never
 # traverse paths (the security review's staging-traversal lesson).
 _ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+#: Public alias so sibling run-artifact sinks (the V2-8 trajectory capture)
+#: enforce one filesystem-safe id rule instead of drifting into copies.
+ID_PATTERN = _ID_PATTERN
 
 
 class DecisionLog:

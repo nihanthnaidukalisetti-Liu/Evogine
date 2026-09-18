@@ -1,10 +1,11 @@
 """Model client seam: the swarm's single doorway to language models.
 
 Roles depend only on the :class:`ModelClient` protocol — never on a concrete
-SDK — so providers stay swappable and P2 can layer multi-provider routing on
-top without touching role code. Resilience (timeouts, bounded retries,
-jittered exponential backoff, Retry-After) is owned in this module rather
-than in role code or provider SDKs: providers make exactly one attempt.
+SDK — so providers stay swappable and multi-provider routing layers on top
+without touching role code. Resilience (timeouts, bounded retries, jittered
+exponential backoff, Retry-After) is owned in this module rather than in
+role code or provider SDKs: providers make exactly one attempt, and
+:class:`FailoverModelClient` owns provider routing.
 """
 
 from __future__ import annotations
@@ -128,6 +129,43 @@ class RetryingModelClient:
         return self._jitter.uniform(0.0, delay)
 
 
+class FailoverModelClient:
+    """Route one completion across providers in priority order.
+
+    The P2 second-provider routing behind the client seam: roles keep coding
+    against :class:`ModelClient`, never knowing which provider served them.
+    The router tries each provider in order and the first success wins.
+
+    Failure semantics — every :class:`ModelClientError` fails over, transient
+    and permanent alike. A permanent error is one provider's judgment about
+    its own account, quota, or request handling; the router is an
+    availability layer and must not treat one provider's rejection as a
+    global truth about the request. When every provider fails, the last
+    error propagates with its origin intact.
+
+    No retries live here — compose each child with
+    :class:`RetryingModelClient` when it should exhaust its own bounded
+    retries before the next provider is tried. A raw child gets exactly one
+    attempt, matching the seam's single-attempt provider contract.
+    """
+
+    def __init__(self, providers: list[ModelClient]) -> None:
+        if not providers:
+            raise ValueError("failover chain must contain at least one provider")
+        self._providers = providers
+
+    def complete(self, request: ModelRequest) -> ModelResponse:
+        errors: list[ModelClientError] = []
+        for provider in self._providers:
+            try:
+                return provider.complete(request)
+            except ModelClientError as exc:
+                errors.append(exc)
+        # Unreachable for a non-empty chain (validated in __init__), but the
+        # last error — not an artifact — is what callers must see.
+        raise errors[-1]
+
+
 class AnthropicClient:
     """Concrete provider: the Anthropic-compatible Messages API.
 
@@ -173,9 +211,7 @@ class AnthropicClient:
         except anthropic.APIStatusError as exc:
             raise ModelPermanentError(f"model rejected the request: {exc}") from exc
         return ModelResponse(
-            text="".join(
-                block.text for block in message.content if isinstance(block, TextBlock)
-            ),
+            text="".join(block.text for block in message.content if isinstance(block, TextBlock)),
             stop_reason=message.stop_reason,
             model=message.model,
             input_tokens=message.usage.input_tokens,

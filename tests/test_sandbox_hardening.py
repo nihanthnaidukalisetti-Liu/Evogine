@@ -148,8 +148,8 @@ class FakeContainers:
         if isinstance(security_opt, list):
             for opt in security_opt:
                 if isinstance(opt, str) and opt.startswith("seccomp="):
-                    profile = Path(opt.split("=", 1)[1])
-                    self._container.seccomp_profile_read = profile.read_text(encoding="utf-8")
+                    # Engine 25+ takes the profile JSON inline — capture it directly.
+                    self._container.seccomp_profile_read = opt[len("seccomp=") :]
         if self.run_fails:
             raise RuntimeError("cannot start container")
         return self._container

@@ -8,7 +8,6 @@ validation is pure JSON logic.
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import pytest
 from test_sandbox_hardening import FakeClient, FakeContainer
@@ -19,7 +18,6 @@ from evogine.sandbox.seccomp import (
     SeccompError,
     build_security_opts,
     load_profile_json,
-    profile_file,
     validate_profile_json,
 )
 
@@ -54,21 +52,22 @@ def test_non_deny_by_default_override_is_rejected() -> None:
         load_profile_json(profile)
 
 
-def test_security_opts_carry_no_new_privileges_and_seccomp(tmp_path: Path) -> None:
-    profile_path = tmp_path / "profile.json"
-    profile_path.write_text(load_profile_json(None), encoding="utf-8")
-    opts = build_security_opts(str(profile_path))
+def test_security_opts_carry_no_new_privileges_and_inline_profile() -> None:
+    opts = build_security_opts(load_profile_json(None))
     assert opts[0] == "no-new-privileges:true"
-    assert opts[1] == f"seccomp={profile_path}"
+    inline = json.loads(opts[1].removeprefix("seccomp="))
+    assert inline["defaultAction"] == "SCMP_ACT_ERRNO"
 
 
-def test_profile_file_is_written_and_removed() -> None:
-    with profile_file(load_profile_json(None)) as path:
-        assert path.exists()
-        content = json.loads(path.read_text(encoding="utf-8"))
-        assert content["defaultAction"] == "SCMP_ACT_ERRNO"
-        assert path.stat().st_mode & 0o777 == 0o600
-    assert not path.exists()
+def test_security_opts_reject_a_path_instead_of_a_profile() -> None:
+    """Engine 25+ decodes the seccomp security-opt as JSON — a path 500s at start.
+
+    Regression for the CI docker-gated run (API 1.48): a temp-file path made
+    every container start fail with 'Decoding seccomp profile failed'. A path
+    value must fail closed here, before any container exists.
+    """
+    with pytest.raises(SeccompError, match="not valid JSON"):
+        build_security_opts("/tmp/evogine-seccomp-profile.json")
 
 
 def test_runner_always_passes_a_seccomp_profile() -> None:
@@ -86,13 +85,11 @@ def test_runner_always_passes_a_seccomp_profile() -> None:
     opts = client.containers.last_kwargs["security_opt"]
     assert isinstance(opts, list) and len(opts) == 2
     assert opts[0] == "no-new-privileges:true"
-    assert opts[1].startswith("seccomp=")
-    # The daemon reads the profile during creation — the file must have
-    # existed with deny-by-default content at the moment of the call.
-    profile_path = Path(opts[1].split("=", 1)[1])
-    assert not profile_path.exists(), "profile file must be removed after the run"
+    # The daemon decodes the profile from the security-opt itself (Engine 25+
+    # dropped path support) — the captured value must be the JSON inline.
+    inline = json.loads(str(opts[1]).removeprefix("seccomp="))
+    assert inline["defaultAction"] == "SCMP_ACT_ERRNO"
     assert container.seccomp_profile_read is not None
-    assert json.loads(container.seccomp_profile_read)["defaultAction"] == "SCMP_ACT_ERRNO"
 
 
 def test_runner_honors_custom_profile_override() -> None:
@@ -105,9 +102,7 @@ def test_runner_honors_custom_profile_override() -> None:
     )
     container = FakeContainer()
     client = FakeClient(container)
-    sandbox = DockerSandbox(
-        config=SandboxConfig(seccomp_profile_json=profile), client=client
-    )
+    sandbox = DockerSandbox(config=SandboxConfig(seccomp_profile_json=profile), client=client)
     sandbox.run("true")
     opts = client.containers.last_kwargs["security_opt"]
     assert isinstance(opts, list)

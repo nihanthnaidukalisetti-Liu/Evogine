@@ -12,19 +12,15 @@ weakened or disabled profile silently downgraded the sandbox.
 The profile is deny-by-default: anything not expressly permitted gets
 ``SCMP_ACT_ERRNO``, and privileged syscalls (``mount``, ``unshare``, ``setns``)
 carry allow rules conditioned on capabilities the sandbox never grants
-(``cap_drop=ALL``). The runner hands the daemon the profile as a file at
-container creation; the file is written fresh per run and removed after.
-The file-path handoff assumes the daemon shares this host's filesystem —
-the single-host daemon posture this sandbox already documents.
+(``cap_drop=ALL``). The profile is handed to the daemon inline as JSON:
+Engine 25+ no longer reads profile paths in ``security-opt`` — a path
+value fails container start with a decode error, so the profile bytes go
+over the API directly, validated before any container exists.
 """
 
 from __future__ import annotations
 
 import json
-import os
-import tempfile
-from collections.abc import Iterator
-from contextlib import contextmanager
 from pathlib import Path
 
 #: Deny-by-default is the contract: a profile that defaults to allow (or to
@@ -80,43 +76,21 @@ def load_profile_json(override: str | None) -> str:
     return override
 
 
-def build_security_opts(profile_path: str) -> list[str]:
-    """The ``security_opt`` list the container runs under: no-new-privileges + seccomp."""
-    return ["no-new-privileges:true", f"seccomp={profile_path}"]
+def build_security_opts(profile_json: str) -> list[str]:
+    """The ``security_opt`` list: no-new-privileges + the seccomp profile inline.
 
-
-@contextmanager
-def profile_file(profile_json: str) -> Iterator[Path]:
-    """Materialize the profile as a 0600 file the daemon reads at creation.
-
-    The daemon consumes the path during container setup, so the file only
-    needs to live until the create call returns; removal is best-effort — a
-    leftover temp file cannot affect any verdict, while failing the run over
-    cleanup would be worse than leaking it.
+    The profile JSON itself is the ``seccomp=`` value — Engine 25+ decodes the
+    security-opt directly and rejects path values at container start. A value
+    that is not a valid deny-by-default profile raises here, before any
+    container exists (fail-closed).
     """
     validate_profile_json(profile_json)
-    fd, name = tempfile.mkstemp(prefix="evogine-seccomp-", suffix=".json")
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(profile_json.encode("utf-8"))
-        Path(name).chmod(0o600)
-        yield Path(name)
-    finally:
-        with_cleanup_suppressed(Path(name))
-
-
-def with_cleanup_suppressed(path: Path) -> None:
-    """Best-effort unlink; failures are unobservable to the verdict either way."""
-    try:
-        path.unlink(missing_ok=True)
-    except OSError:
-        pass
+    return ["no-new-privileges:true", f"seccomp={profile_json}"]
 
 
 __all__ = [
     "SeccompError",
     "build_security_opts",
     "load_profile_json",
-    "profile_file",
     "validate_profile_json",
 ]

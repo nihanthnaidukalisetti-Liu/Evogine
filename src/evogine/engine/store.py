@@ -25,6 +25,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from evogine.engine.embedders import Embedder, HashingEmbedder
 from evogine.engine.records import (
     DecayConfig,
     LearningRecord,
@@ -32,6 +33,8 @@ from evogine.engine.records import (
     RecordCounterfactual,
     decayed_confidence,
 )
+from evogine.engine.retrieval import DEFAULT_FLOOR
+from evogine.engine.retrieval import retrieve as hybrid_retrieve
 
 # Ids become filenames under ``records/``: lock them to filesystem- and
 # git-safe characters so a malicious proposal can never traverse paths
@@ -42,9 +45,6 @@ _ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 # rejection, ``merged`` a terminal absorption — neither merges, decays, nor
 # retires further; their records stay readable for audit either way.
 _LIVE_STATUSES = ("ephemeral", "candidate", "promoted")
-
-_WORD_RE = re.compile(r"[a-z0-9]+")
-
 
 class StoreError(Exception):
     """Lifecycle violation, unknown id, or malformed proposal."""
@@ -95,39 +95,6 @@ def _git(root: Path, *args: str) -> None:
         raise StoreError(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
 
 
-def _tokenize(text: str) -> set[str]:
-    """Lowercase alphanumeric tokens of length >= 3.
-
-    Deliberately crude: this is the v1 lexical ranker, and V2-3 replaces it
-    with hybrid retrieval behind the same promotion-only filter.
-    """
-    return {token for token in _WORD_RE.findall(text.lower()) if len(token) >= 3}
-
-
-def _record_tokens(record: LearningRecord) -> set[str]:
-    """All indexed text of a record: the title AND every body field.
-
-    The V1 audit flagged title-token matching whose body fields never affect
-    ranking; that defect is not rebuilt here.
-    """
-    return _tokenize(
-        f"{record.type} {record.title} {record.body.signal} "
-        f"{record.body.failure_mode} {record.body.detection} {record.body.fix_strategy}"
-    )
-
-
-def _relevance(record: LearningRecord, context_tokens: set[str]) -> float:
-    """Share of the task context's tokens the record covers.
-
-    Zero means no lexical connection at all, so retrieval returns ``[]``
-    honestly instead of falling back to unrelated records.
-    """
-    if not context_tokens:
-        return 0.0
-    hits = len(_record_tokens(record) & context_tokens)
-    return hits / len(context_tokens)
-
-
 class Engine:
     """Durable, git-backed store of :class:`LearningRecord` objects.
 
@@ -139,8 +106,9 @@ class Engine:
     stays in the store, auditable, never deleted.
     """
 
-    def __init__(self, root: Path | str) -> None:
+    def __init__(self, root: Path | str, embedder: Embedder | None = None) -> None:
         self.root = Path(root)
+        self.embedder: Embedder = embedder if embedder is not None else HashingEmbedder()
         self.records_dir = self.root / "records"
         self.audit_path = self.root / "audit.jsonl"
         self.records_dir.mkdir(parents=True, exist_ok=True)
@@ -149,25 +117,23 @@ class Engine:
 
     # ---------------------------------------------------------------- reads
 
-    def retrieve(self, task_context: str, k: int = 5) -> list[LearningRecord]:
+    def promoted_records(self) -> list[LearningRecord]:
+        """All ``promoted`` records — the only pool retrieval may draw from."""
+        return [record for record in self._all_records() if record.status == "promoted"]
+
+    def retrieve(
+        self, task_context: str, k: int = 5, floor: float = DEFAULT_FLOOR
+    ) -> list[LearningRecord]:
         """Return the top-``k`` promoted records relevant to ``task_context``.
 
-        Only ``promoted`` records are ever returned — warm runs must see
-        exactly the knowledge the memory gate has proven. With no promoted
-        match the result is empty: retrieval never invents relevance.
+        Hybrid retrieval (V2-3): promoted records are scored by embedding
+        similarity and lexical overlap over their body fields, and anything
+        below ``floor`` is dropped — with nothing above the floor the result
+        is empty, honestly. Only ``promoted`` records are ever returned —
+        warm runs must see exactly the knowledge the memory gate has proven.
         ``k <= 0`` yields an empty result (top-min(k, n) is empty).
         """
-        if k <= 0:
-            return []
-        context_tokens = _tokenize(task_context)
-        scored = [
-            (_relevance(record, context_tokens), record.id, record)
-            for record in self._all_records()
-            if record.status == "promoted"
-        ]
-        scored = [item for item in scored if item[0] > 0.0]
-        scored.sort(key=lambda item: (-item[0], item[1]))
-        return [record for _, _, record in scored[:k]]
+        return hybrid_retrieve(self, task_context, k=k, floor=floor, embedder=self.embedder)
 
     def get(self, learning_id: str) -> LearningRecord:
         """Return one record by id in whatever lifecycle state it holds.

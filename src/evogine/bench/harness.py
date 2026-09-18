@@ -24,6 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from evogine.bench.budgets import BenchPlan, queue_replays
 from evogine.bench.cases import BenchCase, default_corpus
+from evogine.bench.probes import ContaminationError, recall_probe
 from evogine.bench.protocol import (
     ClaimTag,
     EvalProtocol,
@@ -171,13 +172,15 @@ class BenchHarness:
         and explicit arguments that contradict it are refused rather than
         silently overriding it.
         """
+        pool = list(corpus) if corpus is not None else default_corpus()
         if protocol is not None:
             if plan is not None:
                 raise ValueError(
                     "plan conflicts: the protocol already pins the harness config — "
                     "pass protocol or plan, not both"
                 )
-            check = _validate_protocol_pre_run(protocol, corpus, case_ids, repeats)
+            check = _validate_protocol_pre_run(protocol, pool, case_ids, repeats)
+            _refuse_contaminated_holdout(self._retriever, check, pool)
             cases = list(check.cases)
             effective_repeats = protocol.repeats
         else:
@@ -233,7 +236,7 @@ class BenchHarness:
 
 def _validate_protocol_pre_run(
     protocol: EvalProtocol,
-    corpus: Sequence[BenchCase] | None,
+    pool: Sequence[BenchCase],
     case_ids: Sequence[str] | None,
     repeats: int | None,
 ) -> ProtocolCheck:
@@ -243,7 +246,6 @@ def _validate_protocol_pre_run(
     V2-4 plan semantics): explicit arguments that contradict it are refused
     rather than silently overriding it.
     """
-    pool = list(corpus) if corpus is not None else default_corpus()
     check = pre_run_validate(protocol, pool)
     if case_ids is not None and set(case_ids) != {case.id for case in check.cases}:
         raise ProtocolValidationError(
@@ -254,6 +256,29 @@ def _validate_protocol_pre_run(
             ["repeats conflict: the explicit argument contradicts the protocol"]
         )
     return check
+
+
+def _refuse_contaminated_holdout(
+    retriever: Retriever, check: ProtocolCheck, pool: Sequence[BenchCase]
+) -> None:
+    """V2-7 recall gate: a contaminated holdout is not fresh — refuse pre-spend.
+
+    The protocol's holdout is only fresh while the store holds nothing
+    derived from it. Quoting held-out-unique content means the engine has
+    already seen the family, so any fresh-holdout number the run would
+    produce is void; spend nothing.
+    """
+    if not check.heldout_cases:
+        return
+    probe = recall_probe(retriever, list(check.heldout_cases), corpus=pool)
+    if probe.contaminated:
+        finding = probe.findings[0]
+        raise ContaminationError(
+            f"held-out family {check.protocol.held_out_family!r} is contaminated: "
+            f"record {finding.record_id!r} quotes held-out tokens "
+            f"{finding.matched_tokens} — refusing to run against a holdout "
+            "the engine has already seen (nothing was spent)"
+        )
 
 
 def _resolve_inputs(

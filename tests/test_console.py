@@ -9,11 +9,19 @@ launch tests assert the loopback-only contract and the startup refusals.
 
 from __future__ import annotations
 
+import pytest
+
+# The console is optional transport behind the [console] extra: the core CI
+# jobs never install it, so this module skips as a whole there (one visible
+# skip, the docker-probe precedent) and runs for real in the dedicated
+# console job. The imports after the skip call are module-level-late by
+# design; E402 is ignored for this file in pyproject.
+pytest.importorskip("fastapi")
+
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import pytest
 from fastapi.testclient import TestClient
 
 from evogine.cli import main as cli_main

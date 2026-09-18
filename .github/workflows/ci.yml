@@ -2,10 +2,14 @@ name: CI
 
 # Quality gates for pushes to main and all pull requests: ruff lint, mypy
 # strict over the package, pytest with a coverage floor on evogine.gates and
-# evogine.engine, gitleaks secret scanning, and a Docker-gated job that runs
+# evogine.engine, gitleaks secret scanning, a Docker-gated job that runs
 # the same suite where the daemon exists (ubuntu-latest runners have Docker)
 # so the sandbox's isolation and seccomp guarantees are enforced for real,
-# not just locally. No secrets required by the suite: it makes no live API
+# not just locally, and a console job that runs the optional [console]
+# extra's route suite with its own package coverage floor. The core jobs
+# install only the core extras, so the core install gains no new runtime
+# dependencies; optional-component code skips cleanly there and is tested
+# in its own job. No secrets required by the suite: it makes no live API
 # calls; nothing here needs a token. The gitleaks job runs the pinned
 # release binary directly — the action variant calls the GitHub API to
 # report findings, which fails with "Resource not accessible by" when the
@@ -45,8 +49,11 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install package with dev dependencies
-        run: pip install -e ".[dev]"
+      # The console extra is installed here so strict mypy can resolve and
+      # type the optional evogine.console package; type-time dependency,
+      # not a new runtime dependency of the core install.
+      - name: Install package with dev and console dependencies
+        run: pip install -e ".[dev,console]"
 
       # Strictness lives in [tool.mypy] (pyproject), so this invocation is
       # exactly what a local `mypy src/evogine` runs.
@@ -70,7 +77,9 @@ jobs:
       # Coverage floor on the two contract-bearing packages (gates, engine).
       # Measured at 98% at introduction; the 96% floor blocks meaningful
       # erosion without flaking on Docker-skipped probes (this job never
-      # installs docker-py, so those probes skip cleanly).
+      # installs docker-py, so those probes skip cleanly). The console
+      # tests skip the same way: this job installs no [console] extra, so
+      # the core runtime dependency set is exercised dependency-clean.
       - name: Pytest with coverage floor on gates and engine
         run: >
           pytest -q --cov=evogine.gates --cov=evogine.engine
@@ -116,3 +125,28 @@ jobs:
 
       - name: Pytest with Docker probes active
         run: pytest -q
+
+  # The console is optional transport behind the [console] extra: the core
+  # jobs above never install it and the console tests skip there. This job
+  # runs the console route/refusal/launch suite where the extra exists,
+  # with the console package's own coverage floor.
+  console:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install package with dev and console dependencies
+        run: pip install -e ".[dev,console]"
+
+      # Measured at 96% at introduction; the 90% floor is the console
+      # package's own requirement from the V3 verification matrix.
+      - name: Console route tests with package coverage floor
+        run: >
+          pytest tests/test_console.py -q --cov=evogine.console
+          --cov-report=term-missing --cov-fail-under=90

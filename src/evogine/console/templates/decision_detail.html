@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block title %}{{ detail.row.proposal_id }} · Evogine Console{% endblock %}
+{% block content %}
+<h2>Decision <code>{{ detail.row.proposal_id }}</code></h2>
+<table>
+  <tr><th>Learning</th><td><code>{{ detail.row.learning_id }}</code></td></tr>
+  <tr><th>Stage</th><td>{{ detail.row.stage }}</td></tr>
+  <tr><th>Promoted</th><td>{{ detail.row.promoted }}</td></tr>
+  <tr><th>Decided</th><td class="muted">{{ detail.row.decided_at or "—" }}</td></tr>
+  <tr><th>Reason</th><td><code>{{ detail.row.reason }}</code></td></tr>
+  <tr><th>Evidence ref</th><td>{% if detail.row.evidence_ref %}<code>{{ detail.row.evidence_ref }}</code>{% else %}<span class="muted">none</span>{% endif %}</td></tr>
+  <tr><th>Trajectory ref</th><td>{% if detail.row.trajectory_ref %}<code>{{ detail.row.trajectory_ref }}</code>{% else %}<span class="muted">none</span>{% endif %}</td></tr>
+  <tr><th>Record status</th><td>{% if detail.record_status %}{{ detail.record_status }}{% else %}<span class="error">{{ detail.record_status_note }}</span>{% endif %}</td></tr>
+</table>
+
+<h3>Replay evidence (baseline vs warm, paired by case instance)</h3>
+{% if detail.evidence %}
+<p>
+  Material: <strong>{{ "yes" if detail.evidence.material else "no" }}</strong>
+  (<code>{{ detail.evidence.materiality_detail }}</code>) &middot;
+  replay runs: {% for run_id in detail.evidence.replay_run_ids %}<code>{{ run_id }}</code>{% if not loop.last %}, {% endif %}{% endfor %}
+</p>
+{% if detail.evidence.pairing_error %}
+<p class="error">These arms cannot be paired: {{ detail.evidence.pairing_error }}</p>
+{% else %}
+<table>
+  <tr><th>Case instance</th><th>Baseline</th><th>Warm</th></tr>
+  {% for pair in detail.evidence.pairs %}
+  <tr><td><code>{{ pair.instance_id }}</code></td><td>{{ pair.baseline }}</td><td>{{ pair.warm }}</td></tr>
+  {% endfor %}
+</table>
+{% endif %}
+{% else %}
+<p class="empty">{{ detail.evidence_note }}</p>
+{% endif %}
+
+<h3>Trajectory (sanitized at capture)</h3>
+{% if detail.trajectory %}
+<p class="muted">gate: {{ detail.trajectory.gate }} &middot; started {{ detail.trajectory.started_at or "—" }} &middot; decided {{ detail.trajectory.decided_at or "—" }}</p>
+<table>
+  <tr><th>Seq</th><th>Kind</th><th>Detail</th></tr>
+  {% for step in detail.trajectory.steps %}
+  <tr>
+    <td>{{ step.seq }}</td>
+    <td>{{ step.kind }}</td>
+    <td>
+      {{ step.detail }}
+      {% if step.tool %}
+      <pre>tool: {{ step.tool }}
+arguments: {{ step.arguments }}
+result: {{ step.result }}</pre>
+      {% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<p class="empty">{{ detail.trajectory_note }}</p>
+{% endif %}
+{% endblock %}

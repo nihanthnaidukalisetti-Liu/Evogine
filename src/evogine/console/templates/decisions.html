@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Decisions · Evogine Console{% endblock %}
+{% block content %}
+<h2>Promotion decisions</h2>
+{% if not rows %}
+<p class="empty">No decisions recorded — the promotion pass has not decided anything in this store yet.</p>
+{% else %}
+<table>
+  <tr><th>Proposal</th><th>Stage</th><th>Promoted</th><th>Decided</th><th>Reason (machine-checked)</th></tr>
+  {% for row in rows %}
+  <tr>
+    <td><a href="/decisions/{{ row.proposal_id }}"><code>{{ row.proposal_id }}</code></a></td>
+    <td>{{ row.stage }}</td>
+    <td>{% if row.promoted %}<span class="pill pass">cleared</span>{% else %}<span class="pill muted">no</span>{% endif %}</td>
+    <td class="muted">{{ row.decided_at or "—" }}</td>
+    <td><code>{{ row.reason }}</code></td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+{% endblock %}

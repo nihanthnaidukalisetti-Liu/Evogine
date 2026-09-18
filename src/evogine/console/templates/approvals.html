@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}Approvals · Evogine Console{% endblock %}
+{% block content %}
+<h2>Approvals queue</h2>
+{% if not rows %}
+<p class="empty">No approval requests — nothing has reached the human-approval boundary in this store yet.</p>
+{% else %}
+<table>
+  <tr><th>Proposal</th><th>State</th><th>Created</th><th>Decision trail (machine-checked)</th><th>Human verdict</th></tr>
+  {% for row in rows %}
+  <tr>
+    <td><a href="/decisions/{{ row.learning_id }}"><code>{{ row.proposal_id }}</code></a></td>
+    <td>{% if row.state == "pending" %}<span class="pill pending">pending</span>{% else %}{{ row.state }}{% endif %}</td>
+    <td class="muted">{{ row.created_at or "—" }}</td>
+    <td><code>{{ row.trail_stage }}</code> — {{ row.trail_reason }}</td>
+    <td>
+      {% if row.decided_by %}
+      {{ row.decided_by }} <span class="muted">({{ row.decided_at or "—" }})</span>
+      {% if row.decided_reason %}<br><code>{{ row.decided_reason }}</code>{% endif %}
+      {% else %}
+      <span class="pending">awaiting an operator</span>
+      {% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+<p class="muted">Approve or reject with the <code>evogine approvals</code> CLI — the console is read-only.</p>
+{% endif %}
+{% endblock %}

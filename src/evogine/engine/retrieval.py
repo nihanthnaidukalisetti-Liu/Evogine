@@ -9,20 +9,33 @@ result is a first-class outcome, never a fallback to unrelated records.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 from evogine.engine.embedders import HashingEmbedder, cosine_similarity, scoring_tokens
 from evogine.engine.records import LearningRecord
 
 if TYPE_CHECKING:
     from evogine.engine.embedders import Embedder
-    from evogine.engine.store import Engine
 
 #: The task context is the plain text a warm run is about to act on.
 TaskContext = str
 
 #: Below this hybrid score a record is irrelevant: retrieval returns [].
 DEFAULT_FLOOR = 0.35
+
+
+class PromotedPool(Protocol):
+    """What hybrid retrieval scores against: a promotion-only record pool.
+
+    :class:`evogine.engine.store.Engine` satisfies this structurally — and
+    so do in-memory pool views (the shadow pass's overlay retriever), so
+    overlay scoring reuses exactly this function rather than growing a
+    second scoring implementation.
+    """
+
+    def promoted_records(self) -> list[LearningRecord]:
+        """Return the promoted records — the only pool retrieval may draw from."""
+        ...
 
 
 def body_text(record: LearningRecord) -> str:
@@ -47,7 +60,7 @@ def lexical_overlap(record: LearningRecord, context: TaskContext) -> float:
 
 
 def retrieve(
-    store: Engine,
+    store: PromotedPool,
     task_context: TaskContext,
     k: int = 5,
     floor: float = DEFAULT_FLOOR,
@@ -55,6 +68,8 @@ def retrieve(
 ) -> list[LearningRecord]:
     """Top-``k`` promoted records for ``task_context`` — or [] below ``floor``.
 
+    ``store`` is any promotion-only pool (the engine store, or an in-memory
+    view of one).
     Hybrid score = max(cosine(embedder, record.body), lexical_overlap(record, ctx)).
     Titles alone can never qualify a record; body fields always participate.
     An empty return is a first-class outcome: warm runs must not invent

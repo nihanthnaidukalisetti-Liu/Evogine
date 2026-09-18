@@ -6,8 +6,9 @@ the in-process realization over :class:`evogine.bench.harness.BenchHarness`:
 for the canonical run id ``replay-<learning_id>-baseline`` it replays the
 corpus with the knowledge absent (the harness's cold arm — knowledge-free by
 contract), and for ``replay-<learning_id>-warm`` it replays with the
-candidate learning applied over an overlay retriever (the store's promotion-
-only retrieval plus the candidate, as it would be served if promoted).
+candidate learning applied over the generalized overlay retriever
+(:class:`evogine.bench.shadow.OverlayRetriever` — the store's promotion-only
+pool plus the candidate, as it would be served if promoted).
 Verdicts pair per case instance across arms, so the gate's materiality stage
 aligns them by identity.
 
@@ -21,7 +22,7 @@ from __future__ import annotations
 from evogine.bench.cases import BenchCase
 from evogine.bench.harness import BenchHarness, CaseRunner, Retriever
 from evogine.bench.replay import REPEAT_FLOOR
-from evogine.engine.records import LearningRecord
+from evogine.bench.shadow import OverlayRetriever
 from evogine.engine.store import Engine
 from evogine.gates.materiality import Verdict
 from evogine.gates.replay import Arm, ReplayRun
@@ -38,28 +39,6 @@ def replay_run_ids(learning_id: str) -> list[str]:
         f"{REPLAY_RUN_PREFIX}-{learning_id}-{BASELINE_ARM}",
         f"{REPLAY_RUN_PREFIX}-{learning_id}-{WARM_ARM}",
     ]
-
-
-class _OverlayRetriever:
-    """Store retrieval plus the candidate applied — the counterfactual warm arm.
-
-    The engine serves promoted records only; a candidate is not promoted
-    yet. The overlay injects it ahead of whatever the store already serves,
-    deduplicated and still bounded by ``k``.
-    """
-
-    def __init__(self, engine: Engine, candidate: LearningRecord) -> None:
-        self._engine = engine
-        self._candidate = candidate
-
-    def retrieve(self, task_context: str, k: int = 5) -> list[LearningRecord]:
-        records = [self._candidate]
-        records += [
-            record
-            for record in self._engine.retrieve(task_context, k=k)
-            if record.id != self._candidate.id
-        ]
-        return records[:k]
 
 
 class HarnessReplayRunner:
@@ -96,7 +75,11 @@ class HarnessReplayRunner:
             if arm == BASELINE_ARM:
                 retriever = self._engine
             else:
-                retriever = _OverlayRetriever(self._engine, record)
+                retriever = OverlayRetriever(
+                    pool=self._engine.promoted_records(),
+                    overlay=[record],
+                    embedder=self._engine.embedder,
+                )
             report = BenchHarness(retriever, self._runner).run(
                 corpus=self._corpus, repeats=self._repeats
             )

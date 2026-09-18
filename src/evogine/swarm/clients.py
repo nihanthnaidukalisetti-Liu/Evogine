@@ -25,7 +25,6 @@ class ModelRequest(BaseModel):
     system: str
     user: str
     max_tokens: int = Field(default=1024, gt=0)
-    temperature: float = Field(default=0.0, ge=0.0, le=1.0)
 
 
 class ModelResponse(BaseModel):
@@ -160,7 +159,6 @@ class AnthropicClient:
                 system=request.system,
                 messages=[{"role": "user", "content": request.user}],
                 max_tokens=request.max_tokens,
-                temperature=request.temperature,
             )
         except anthropic.APITimeoutError as exc:  # before APIConnectionError: subclass
             raise ModelTransientError(f"model request timed out: {exc}") from exc

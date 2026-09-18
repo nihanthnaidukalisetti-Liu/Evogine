@@ -14,6 +14,7 @@ MODULES = [
     "evogine.swarm",
     "evogine.swarm.roles",
     "evogine.bench",
+    "evogine.bench.budgets",
     "evogine.bench.cases",
     "evogine.bench.harness",
     "evogine.bench.replay",

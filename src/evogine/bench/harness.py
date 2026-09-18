@@ -22,6 +22,7 @@ from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict
 
+from evogine.bench.budgets import BenchPlan, queue_replays
 from evogine.bench.cases import BenchCase, default_corpus
 from evogine.bench.replay import REPEAT_FLOOR, Arm, build_replay_requests
 from evogine.engine.records import LearningRecord
@@ -43,8 +44,8 @@ class CaseOutcome(BaseModel):
 class Retriever(Protocol):
     """What the harness needs from the engine: promotion-only retrieval.
 
-    ``evogine.engine.store.Engine`` satisfies this structurally once
-    implemented; tests use offline stubs.
+    :class:`evogine.engine.store.Engine` satisfies this structurally;
+    tests use offline stubs.
     """
 
     def retrieve(self, task_context: str, k: int = 5) -> list[LearningRecord]:
@@ -135,14 +136,19 @@ class BenchHarness:
         *,
         repeats: int | None = None,
         corpus: Sequence[BenchCase] | None = None,
+        plan: BenchPlan | None = None,
     ) -> BenchReport:
         """Run ``case_ids`` (default: the full 10-case corpus) cold and warm.
 
         The full replay schedule is queued before execution so spend is a
         checked plan; a repeat count below the 4-repeat floor is refused.
+        When ``plan`` declares replay budgets, an exceeding schedule is
+        refused at queue time — before the first replay is spent.
         """
-        cases, effective_repeats = _resolve_inputs(case_ids, repeats, corpus)
-        build_replay_requests(cases, effective_repeats)
+        cases, effective_repeats = _resolve_inputs(case_ids, repeats, corpus, plan)
+        requests = build_replay_requests(cases, effective_repeats)
+        if plan is not None:
+            queue_replays(requests, plan.budgets)  # V2-4: refuse before spend
         case_reports: list[CaseReport] = []
         for case in cases:
             cold_knowledge: list[LearningRecord] = []
@@ -181,15 +187,25 @@ def _resolve_inputs(
     case_ids: Sequence[str] | None,
     repeats: int | None,
     corpus: Sequence[BenchCase] | None,
+    plan: BenchPlan | None,
 ) -> tuple[list[BenchCase], int]:
-    """Resolve the effective case selection and repeat count for a run."""
+    """Resolve the effective case selection and repeat count for a run.
+
+    A plan is the first-class source of run config (V2-4): explicit
+    arguments that contradict a declared plan are refused rather than
+    silently overriding it.
+    """
     cases = list(corpus) if corpus is not None else default_corpus()
     by_id = {case.id: case for case in cases}
     if len(by_id) != len(cases):
         raise ValueError("duplicate case ids in corpus")
 
-    if case_ids is not None:
-        selected_ids = list(case_ids)
+    plan_ids = plan.case_ids if plan is not None else None
+    if case_ids is not None and plan_ids is not None and set(case_ids) != set(plan_ids):
+        raise ValueError("case_ids conflict: the explicit argument contradicts the plan")
+    selected_ids = case_ids if case_ids is not None else plan_ids
+
+    if selected_ids is not None:
         if not selected_ids:
             raise ValueError("case selection is empty — refusing to run zero cases")
         if len(set(selected_ids)) != len(selected_ids):
@@ -199,11 +215,17 @@ def _resolve_inputs(
             raise ValueError(f"unknown case ids {unknown}; corpus has {sorted(by_id)}")
         cases = [by_id[case_id] for case_id in selected_ids]
 
-    if repeats is None:
-        repeats = REPEAT_FLOOR
-    if repeats < REPEAT_FLOOR:
-        raise ValueError(f"repeats={repeats} is below the {REPEAT_FLOOR}-repeat floor")
-    return cases, repeats
+    plan_repeats = plan.repeats if plan is not None else None
+    if repeats is not None and plan_repeats is not None and repeats != plan_repeats:
+        raise ValueError("repeats conflict: the explicit argument contradicts the plan")
+    effective_repeats = repeats if repeats is not None else plan_repeats
+    if effective_repeats is None:
+        effective_repeats = REPEAT_FLOOR
+    if effective_repeats < REPEAT_FLOOR:
+        raise ValueError(
+            f"repeats={effective_repeats} is below the {REPEAT_FLOOR}-repeat floor"
+        )
+    return cases, effective_repeats
 
 
 def _arm_summary(arm: Arm, outcomes: list[CaseOutcome]) -> ArmSummary:

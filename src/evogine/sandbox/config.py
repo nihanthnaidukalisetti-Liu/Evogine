@@ -23,6 +23,10 @@ class SandboxConfig(BaseModel):
     # pytest + hypothesis, so all must exist inside the container. Matches the
     # versions this repo's CI validates.
     pinned_deps: tuple[str, ...] = (
+        # anthropic: the swarm test modules import evogine.swarm.clients at
+        # collection — without it the gate image cannot run the candidate
+        # suite and every clean-patch acceptance is rejected on collection.
+        "anthropic==1.7.0",
         "pydantic==2.13.5",
         "pyyaml==6.0.3",
         "pytest==9.1.1",

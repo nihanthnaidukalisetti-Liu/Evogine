@@ -33,6 +33,7 @@ from evogine.bench.protocol import (
     pre_run_validate,
 )
 from evogine.bench.replay import REPEAT_FLOOR, Arm, build_replay_requests
+from evogine.bench.rundirs import RunDirectory
 from evogine.bench.stats import (
     HeadlineClaim,
     PairedCaseStats,
@@ -53,6 +54,40 @@ class CaseOutcome(BaseModel):
     passed: bool
     output: str
     knowledge_ids: list[str]
+
+
+class RunArtifacts:
+    """CaseOutcome persistence over a run directory (P2 resume).
+
+    Outcomes are keyed by their full replay identity (case, arm, repeat),
+    so a resumed run reuses exactly the outcomes already on disk and
+    re-executes only what is genuinely missing — a rerun neither duplicates
+    spend nor clobbers recorded evidence. The harness stays pure when no
+    ``RunArtifacts`` is passed.
+    """
+
+    def __init__(self, run: RunDirectory) -> None:
+        self._run = run
+
+    @property
+    def run(self) -> RunDirectory:
+        return self._run
+
+    def load(self, case_id: str, arm: Arm, repeat: int) -> CaseOutcome | None:
+        raw = self._run.read_artifact(self._key(case_id, arm, repeat))
+        if raw is None:
+            return None
+        return CaseOutcome.model_validate_json(raw)
+
+    def save(self, outcome: CaseOutcome) -> None:
+        self._run.write_artifact(
+            self._key(outcome.case_id, outcome.arm, outcome.repeat),
+            outcome.model_dump_json(),
+        )
+
+    @staticmethod
+    def _key(case_id: str, arm: Arm, repeat: int) -> str:
+        return f"outcome-{case_id}-{arm}-{repeat:04d}"
 
 
 class Retriever(Protocol):
@@ -159,6 +194,7 @@ class BenchHarness:
         corpus: Sequence[BenchCase] | None = None,
         plan: BenchPlan | None = None,
         protocol: EvalProtocol | None = None,
+        artifacts: RunArtifacts | None = None,
     ) -> BenchReport:
         """Run ``case_ids`` (default: the full 10-case corpus) cold and warm.
 
@@ -171,6 +207,13 @@ class BenchHarness:
         protocol is validated against the corpus before anything is spent,
         and explicit arguments that contradict it are refused rather than
         silently overriding it.
+
+        When ``artifacts`` is given (P2), every outcome is recorded into the
+        run directory as it is spent, and outcomes already recorded there
+        are reused instead of re-executed — rerunning with the same run
+        directory resumes it, redoing only missing work, and never
+        clobbers recorded evidence. Completion is the caller's call
+        (``run.mark_complete()``); the harness never freezes a run itself.
         """
         pool = list(corpus) if corpus is not None else default_corpus()
         if protocol is not None:
@@ -194,24 +237,39 @@ class BenchHarness:
             else {}
         )
         case_reports: list[CaseReport] = []
+
+        def outcome_for(
+            case: BenchCase,
+            arm: Arm,
+            repeat: int,
+            knowledge: list[LearningRecord],
+        ) -> CaseOutcome:
+            """Reuse a recorded outcome when resuming; spend and record otherwise."""
+            if artifacts is not None:
+                recorded = artifacts.load(case.id, arm, repeat)
+                if recorded is not None:
+                    return recorded
+            outcome = self._execute(case, arm, repeat, knowledge)
+            if artifacts is not None:
+                artifacts.save(outcome)
+            return outcome
+
         for case in cases:
             cold_knowledge: list[LearningRecord] = []
             cold_outcomes = [
-                self._execute(case, "cold", repeat, cold_knowledge)
+                outcome_for(case, "cold", repeat, cold_knowledge)
                 for repeat in range(effective_repeats)
             ]
             warm_knowledge = list(self._retriever.retrieve(case.task_context))
             warm_outcomes = [
-                self._execute(case, "warm", repeat, warm_knowledge)
+                outcome_for(case, "warm", repeat, warm_knowledge)
                 for repeat in range(effective_repeats)
             ]
             case_reports.append(
                 _case_report(case, cold_outcomes, warm_outcomes, claim_tags.get(case.id))
             )
         claims = (
-            headline_claims(_paired_stats(case_reports), protocol)
-            if protocol is not None
-            else []
+            headline_claims(_paired_stats(case_reports), protocol) if protocol is not None else []
         )
         return _build_report(case_reports, effective_repeats, claims)
 
@@ -320,9 +378,7 @@ def _resolve_inputs(
     if effective_repeats is None:
         effective_repeats = REPEAT_FLOOR
     if effective_repeats < REPEAT_FLOOR:
-        raise ValueError(
-            f"repeats={effective_repeats} is below the {REPEAT_FLOOR}-repeat floor"
-        )
+        raise ValueError(f"repeats={effective_repeats} is below the {REPEAT_FLOOR}-repeat floor")
     return cases, effective_repeats
 
 
@@ -386,24 +442,17 @@ def _build_report(
     summary = RunSummary(
         repeats=repeats,
         replays=sum(
-            len(report.cold.outcomes) + len(report.warm.outcomes)
-            for report in case_reports
+            len(report.cold.outcomes) + len(report.warm.outcomes) for report in case_reports
         ),
         cold_pass_rate=_mean([report.cold.pass_rate for report in case_reports]),
         warm_pass_rate=_mean([report.warm.pass_rate for report in case_reports]),
-        mean_delta_pass_rate=_mean(
-            [report.delta_pass_rate for report in case_reports]
-        ),
-        regressions=sorted(
-            report.case_id for report in case_reports if report.delta_pass_rate < 0
-        ),
+        mean_delta_pass_rate=_mean([report.delta_pass_rate for report in case_reports]),
+        regressions=sorted(report.case_id for report in case_reports if report.delta_pass_rate < 0),
         improvements=sorted(
             report.case_id for report in case_reports if report.delta_pass_rate > 0
         ),
     )
-    return BenchReport(
-        repeats=repeats, cases=case_reports, summary=summary, claims=claims or []
-    )
+    return BenchReport(repeats=repeats, cases=case_reports, summary=summary, claims=claims or [])
 
 
 def _binary_variance(verdicts: Sequence[bool]) -> float:

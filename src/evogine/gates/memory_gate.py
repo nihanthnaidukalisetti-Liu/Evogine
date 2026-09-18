@@ -32,6 +32,11 @@ the store: rejected knowledge remains auditable, never deleted.
 
 from __future__ import annotations
 
+import inspect
+import json
+import os
+from datetime import UTC, datetime
+
 from evogine.engine.records import LearningRecord
 from evogine.engine.store import Engine
 from evogine.gates.approvals import ApprovalError, ApprovalLog
@@ -43,10 +48,12 @@ from evogine.gates.materiality import (
 )
 from evogine.gates.replay import ReplayRunner
 from evogine.gates.telemetry import (
+    ID_PATTERN,
     DecisionLog,
     DecisionStage,
     PromotionDecision,
     RunsEvidenceSink,
+    TelemetryError,
     check_reason,
 )
 from evogine.gates.trajectory import TrajectoryRecorder, TrajectoryStore
@@ -85,7 +92,11 @@ class MemoryGate:
         self._trajectories = trajectories
 
     def review(
-        self, record: LearningRecord, replay_run_ids: list[str]
+        self,
+        record: LearningRecord,
+        replay_run_ids: list[str],
+        *,
+        pass_id: str | None = None,
     ) -> PromotionDecision:
         """Decide ``record`` from its counterfactual replay; record the verdict.
 
@@ -97,9 +108,26 @@ class MemoryGate:
         the proposal is refused in the recorded decision instead. The
         returned :class:`PromotionDecision` is already persisted in the
         log, with its trajectory stamped when a store is wired.
+
+        ``pass_id`` (V3) attributes the decision to the promotion pass
+        running it — the pass is a fact about a decision's provenance, not
+        about the knowledge, so it rides on the record rather than the
+        reason vocabulary. Review latency (V3) is computed here from the
+        two existing clocks: ``decided_at`` minus the record's ``created``
+        timestamp — how long the knowledge waited for its verdict.
         """
+        if pass_id is not None and not ID_PATTERN.fullmatch(pass_id):
+            raise TelemetryError(f"pass id {pass_id!r} must match {ID_PATTERN.pattern}")
         trajectory = TrajectoryRecorder(gate="memory_gate", proposal_id=record.id)
         decision, evidence_payload = self._decide(record, replay_run_ids, trajectory)
+        decision = decision.model_copy(
+            update={
+                "review_latency_seconds": (
+                    decision.decided_at - record.created
+                ).total_seconds(),
+                "pass_id": pass_id,
+            }
+        )
         if self._evidence is not None and evidence_payload is not None:
             evidence_ref = self._evidence.write(record.id, evidence_payload)
             decision = decision.model_copy(update={"evidence_ref": evidence_ref})
@@ -304,10 +332,45 @@ def run_promotion_pass(engine: Engine, gate: MemoryGate) -> list[PromotionDecisi
     store order. Every decision is already persisted in the gate's log: a
     decided proposal without a decision record is a bug (V2-1 completeness
     invariant).
+
+    V3 pass identity: the pass mints a filesystem-safe ``pass_id`` and
+    stamps it on every decision it produces and on the audit events its
+    demotions cause, then writes a manifest to ``passes/<pass_id>.json``
+    at the store root — what ran, what it decided, and the per-decision
+    review latency. The manifest is written only after every candidate is
+    decided, so a crash mid-pass leaves no file: an absent manifest means
+    the pass did not finish, never that it decided nothing. Like the
+    decision log, the manifest waits untracked for the next lifecycle
+    commit to sweep it into the store's history.
+
+    Stores that implement only the narrow candidates/promote/demote
+    contract — the trajectory and separation test doubles — get the same
+    decide-and-demote flow with no filesystem artifacts: there is no root
+    to write a manifest into and no audit trail to stamp.
     """
+    # The pass id becomes the manifest filename under passes/ — mint it
+    # against the shared filesystem-safe id rule and refuse to proceed if
+    # generation ever drifts (a hostile id must never reach a path).
+    pass_id = (
+        f"pass-{datetime.now(UTC).strftime('%Y%m%dT%H%M%S')}-"
+        f"{os.urandom(4).hex()}"
+    )
+    if not ID_PATTERN.fullmatch(pass_id):
+        raise TelemetryError(f"generated pass id {pass_id!r} is not filesystem-safe")
+    started_at = datetime.now(UTC)
+
+    # Filesystem artifacts belong to the real git-backed store: doubles in
+    # the telemetry tests have no root (manifest) and their demote takes no
+    # pass identity (audit stamping). Probed once per pass, explicitly.
+    store_root = getattr(engine, "root", None)
+    stamps_audit = "pass_id" in inspect.signature(engine.demote).parameters
+
+    candidates = engine.candidates()
     decisions: list[PromotionDecision] = []
-    for record in engine.candidates():
-        decision = gate.review(record, record.counterfactual.replay_run_ids)
+    for record in candidates:
+        decision = gate.review(
+            record, record.counterfactual.replay_run_ids, pass_id=pass_id
+        )
         # Only knowledge-stage rejections move the store. GATE_ERROR is
         # infrastructure (retryable); APPROVAL is the human boundary —
         # proposed or refused, the decision belongs to a person, not a pass.
@@ -316,6 +379,40 @@ def run_promotion_pass(engine: Engine, gate: MemoryGate) -> list[PromotionDecisi
             and decision.stage is not DecisionStage.GATE_ERROR
             and decision.stage is not DecisionStage.APPROVAL
         ):
-            engine.demote(record.id, decision.reason)
+            if stamps_audit:
+                engine.demote(record.id, decision.reason, pass_id=pass_id)
+            else:
+                engine.demote(record.id, decision.reason)
         decisions.append(decision)
+
+    if store_root is None:
+        return decisions
+
+    counts: dict[str, int] = {}
+    for decision in decisions:
+        counts[decision.stage.value] = counts.get(decision.stage.value, 0) + 1
+    manifest = {
+        "pass_id": pass_id,
+        "started_at": started_at.isoformat(),
+        "finished_at": datetime.now(UTC).isoformat(),
+        "candidates": [record.id for record in candidates],
+        "decisions": [
+            {
+                "proposal_id": decision.proposal_id,
+                "stage": decision.stage.value,
+                "promoted": decision.promoted,
+                "review_latency_seconds": decision.review_latency_seconds,
+            }
+            for decision in decisions
+        ],
+        "counts_by_stage": counts,
+    }
+    passes_dir = store_root / "passes"
+    passes_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = passes_dir / f"{pass_id}.json"
+    tmp = manifest_path.with_suffix(".json.tmp")
+    tmp.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    os.replace(tmp, manifest_path)
     return decisions

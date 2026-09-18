@@ -20,6 +20,7 @@ candidate, so refused knowledge cannot be re-proposed unchanged).
 from __future__ import annotations
 
 import os
+import re
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -27,7 +28,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 from evogine.engine.records import LearningRecord, RecordCounterfactual
-from evogine.engine.store import Engine
+from evogine.engine.store import Engine, store_lock
 from evogine.gates.telemetry import (
     # Package-internal reuse: the same filesystem-safe id rule the decision
     # log and the store apply — proposals become filenames under approvals/.
@@ -40,6 +41,36 @@ from evogine.gates.telemetry import (
 
 class ApprovalError(Exception):
     """An approval action violates the boundary contract: refused or misuse."""
+
+
+# Operator identity format (V3): a nonblank printable identity of at most
+# 64 characters — a handle ("nihanth"), a display name ("Nihanth Naidu
+# Kalisetti"), or an email ("nihanthnaidu008@gmail.com"). Leading and
+# trailing whitespace is stripped; control characters (notably newlines,
+# which would corrupt one-event-per-line audit greps) and quoting/bracket
+# punctuation are refused. Legacy decision files stay readable unchanged:
+# validation happens here, at the boundary, only when a new identity is
+# recorded — never on load.
+OPERATOR_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._'@+-]{0,63}$")
+
+
+def operator_identity(raw: str) -> str:
+    """Validate an operator identity for the human-approval boundary.
+
+    Returns the stripped identity; raises :class:`ApprovalError` when it
+    is blank or does not match the accepted format. Both decision paths
+    funnel ``decided_by`` through the log's ``record_*`` methods, so this
+    is the one choke point every future transport inherits.
+    """
+    identity = raw.strip()
+    if not identity:
+        raise ApprovalError("operator identity must not be blank")
+    if not OPERATOR_PATTERN.fullmatch(identity):
+        raise ApprovalError(
+            f"operator identity {identity!r} does not match the accepted format "
+            "(letters, digits, spaces, . _ ' @ + - ; up to 64 characters)"
+        )
+    return identity
 
 
 class ApprovalState(str, Enum):
@@ -160,8 +191,7 @@ class ApprovalLog:
     ) -> PromotionProposal:
         """Record a human approval: ``pending -> approved``."""
         proposal = self._require_pending(proposal_id)
-        if not decided_by.strip():
-            raise ApprovalError("approval requires a decided_by identity")
+        decided_by = operator_identity(decided_by)
         decided = proposal.model_copy(
             update={
                 "state": ApprovalState.APPROVED,
@@ -178,8 +208,7 @@ class ApprovalLog:
     ) -> PromotionProposal:
         """Record a human rejection: ``pending -> rejected`` (reason required)."""
         proposal = self._require_pending(proposal_id)
-        if not decided_by.strip():
-            raise ApprovalError("rejection requires a decided_by identity")
+        decided_by = operator_identity(decided_by)
         if not reason.strip():
             raise ApprovalError("rejection requires a reason")
         decided = proposal.model_copy(
@@ -240,6 +269,11 @@ def approve_proposal(
 ) -> LearningRecord:
     """Apply an approved proposal: the human decision promotes the record.
 
+    The store's advisory review lock is held across the whole window, so a
+    concurrent second decision — from the CLI or any transport — blocks
+    and then fails its own pending re-check below instead of racing this
+    one (V3: the boundary's read-modify-write window is the one real TOCTOU).
+
     Order is fail-safe: the proposal is verified (pending, evidence
     attached, record still a candidate) and the human approval is recorded
     before the store is touched — every failure window leaves the
@@ -248,35 +282,36 @@ def approve_proposal(
     re-checks its own promotion invariants (run coverage, verdict change);
     the boundary applies the promotion, it never bypasses the store's.
     """
-    proposal = log.get(proposal_id)
-    if proposal.state is not ApprovalState.PENDING:
-        raise ApprovalError(
-            f"proposal {proposal_id} is already {proposal.state.value}; "
-            "decided proposals are final"
+    with store_lock(engine.root):
+        proposal = log.get(proposal_id)
+        if proposal.state is not ApprovalState.PENDING:
+            raise ApprovalError(
+                f"proposal {proposal_id} is already {proposal.state.value}; "
+                "decided proposals are final"
+            )
+        # Defense in depth: a proposal file that lost its evidence after render
+        # (hand-edit, partial write) must not survive the human step either.
+        if proposal.evidence_ref is None:
+            raise ApprovalError(
+                f"proposal {proposal_id} carries no replay evidence; cannot approve"
+            )
+        record = engine.get(proposal.learning_id)
+        if record.status != "candidate":
+            raise ApprovalError(
+                f"proposal {proposal_id} cannot be approved: {proposal.learning_id} "
+                f"is {record.status}, not candidate"
+            )
+        log.record_approval(proposal_id, decided_by=decided_by, reason=reason)
+        promoted = engine.promote(
+            proposal.learning_id,
+            RecordCounterfactual(
+                replay_run_ids=proposal.decision.replay_run_ids,
+                verdict_change=True,
+                evidence=proposal.evidence_ref,
+            ),
         )
-    # Defense in depth: a proposal file that lost its evidence after render
-    # (hand-edit, partial write) must not survive the human step either.
-    if proposal.evidence_ref is None:
-        raise ApprovalError(
-            f"proposal {proposal_id} carries no replay evidence; cannot approve"
-        )
-    record = engine.get(proposal.learning_id)
-    if record.status != "candidate":
-        raise ApprovalError(
-            f"proposal {proposal_id} cannot be approved: {proposal.learning_id} "
-            f"is {record.status}, not candidate"
-        )
-    log.record_approval(proposal_id, decided_by=decided_by, reason=reason)
-    promoted = engine.promote(
-        proposal.learning_id,
-        RecordCounterfactual(
-            replay_run_ids=proposal.decision.replay_run_ids,
-            verdict_change=True,
-            evidence=proposal.evidence_ref,
-        ),
-    )
-    log.record_applied(proposal_id)
-    return promoted
+        log.record_applied(proposal_id)
+        return promoted
 
 
 def reject_proposal(
@@ -289,6 +324,10 @@ def reject_proposal(
 ) -> LearningRecord:
     """Refuse a proposal and demote the record: rejection is a knowledge verdict.
 
+    The store's advisory review lock is held across the whole window, as in
+    :func:`approve_proposal` — a concurrent second decision blocks and then
+    fails its own pending re-check.
+
     The human's identity and reason are recorded on the proposal, and the
     record is demoted to ``dropped`` — the store's rejection state,
     auditable, never deleted. Demotion matches the gate's own
@@ -298,6 +337,7 @@ def reject_proposal(
     failure (the record already dropped, say) still shows who refused and
     why.
     """
-    proposal = log.get(proposal_id)
-    log.record_rejection(proposal_id, decided_by=decided_by, reason=reason)
-    return engine.demote(proposal.learning_id, f"rejected by {decided_by}: {reason}")
+    with store_lock(engine.root):
+        proposal = log.get(proposal_id)
+        log.record_rejection(proposal_id, decided_by=decided_by, reason=reason)
+        return engine.demote(proposal.learning_id, f"rejected by {decided_by}: {reason}")

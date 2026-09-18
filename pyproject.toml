@@ -20,9 +20,11 @@ docker = [
 ]
 dev = [
     "pytest",
+    "pytest-cov",
     "ruff",
     "mypy",
     "hypothesis",
+    "types-PyYAML",
 ]
 
 [project.scripts]
@@ -44,3 +46,10 @@ target-version = "py312"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/evogine"]
+
+[tool.mypy]
+# Strict typing on the whole package — every module is a new V2 module, so
+# there is no legacy surface to carve out. Config lives here (not in the CI
+# invocation) so a local `mypy src/evogine` enforces exactly what CI does.
+python_version = "3.12"
+strict = true

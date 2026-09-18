@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 
 import pytest
+from test_sandbox_hardening import FakeClient, FakeContainer
 
 from evogine.sandbox.config import SandboxConfig
 from evogine.sandbox.docker_runner import DockerSandbox, SandboxError
@@ -21,7 +22,6 @@ from evogine.sandbox.seccomp import (
     profile_file,
     validate_profile_json,
 )
-from tests.test_sandbox_hardening import FakeClient, FakeContainer
 
 
 def test_default_profile_is_bundled_and_deny_by_default() -> None:

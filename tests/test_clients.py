@@ -41,6 +41,18 @@ def _error_body(type_: str, message: str) -> dict[str, object]:
     return {"type": "error", "error": {"type": type_, "message": message}}
 
 
+class _StubServer(ThreadingHTTPServer):
+    """Gate-container-tolerant stub server.
+
+    The CI gate container runs suites under tight process limits; a larger
+    listen backlog keeps loaded runs from refusing connections that arrive
+    while previous connection threads are still being reaped.
+    """
+
+    daemon_threads = True
+    request_queue_size = 64
+
+
 class StubAnthropicAPI:
     """Scriptable loopback stub of the Anthropic Messages API.
 
@@ -51,7 +63,7 @@ class StubAnthropicAPI:
         self._lock = threading.Lock()
         self._script: list[tuple[int, dict[str, object], float, dict[str, str]]] = []
         self._requests: list[dict[str, object]] = []
-        self._server = ThreadingHTTPServer(("127.0.0.1", 0), _handler_for(self))
+        self._server = _StubServer(("127.0.0.1", 0), _handler_for(self))
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
 
@@ -99,13 +111,21 @@ def _handler_for(api: StubAnthropicAPI) -> type[BaseHTTPRequestHandler]:
             if delay:
                 time.sleep(delay)
             data = json.dumps(payload).encode()
-            self.send_response(status)
-            for key, value in extra.items():
-                self.send_header(key, value)
-            self.send_header("content-type", "application/json")
-            self.send_header("content-length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
+            try:
+                self.send_response(status)
+                for key, value in extra.items():
+                    self.send_header(key, value)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                # The client timed out and hung up while this handler was
+                # still working (e.g. the scripted delay outlived the client's
+                # timeout under a loaded runner). Abandon the response quietly
+                # instead of surfacing a BrokenPipe traceback; the test asserts
+                # on the client side.
+                return
 
         def log_message(self, format: str, *args: object) -> None:
             return  # keep test output clean

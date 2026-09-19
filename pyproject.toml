@@ -58,6 +58,7 @@ target-version = "py312"
 # before the fastapi import, so module-level imports follow a statement by
 # design and run for real in the dedicated console CI job.
 "tests/test_console.py" = ["E402"]
+"tests/test_console_funnel.py" = ["E402"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/evogine"]

@@ -1,8 +1,9 @@
 """The FastAPI application factory: routes are a thin transport over views.
 
-Five read-only pages — overview, decisions, one decision's drill-down, the
-approvals queue, and the audit timeline — render the typed views from
-:mod:`evogine.console.views`. There is deliberately no write route and no
+Six read-only pages — overview, decisions, one decision's drill-down, the
+approvals queue, the audit timeline, and the proposal funnel — render the
+typed views from :mod:`evogine.console.views` and
+:mod:`evogine.console.funnel`. There is deliberately no write route and no
 auth stack in this PR: the console foundation is read-only (the write path
 through the boundary functions is a separate, reviewed change), and the
 server binds loopback only, so there is nothing exposed to authenticate.
@@ -25,6 +26,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import Response
 
 from evogine.console import views
+from evogine.console.funnel import funnel_routes
 from evogine.console.launch import ConsoleError, validate_operator
 
 _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
@@ -116,5 +118,7 @@ def create_app(root: Path | str, operator: str) -> FastAPI:
         except ConsoleError as exc:
             return refusal(request, 500, str(exc))
         return render(request, "audit.html", {"rows": timeline, "empty": not timeline})
+
+    app.include_router(funnel_routes(store_root, render))
 
     return app

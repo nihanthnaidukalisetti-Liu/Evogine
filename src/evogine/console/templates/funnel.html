@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% block title %}Funnel · Evogine Console{% endblock %}
+{% block content %}
+<h2>Proposal funnel</h2>
+<p class="muted">The same report <code>evogine decisions funnel</code> prints, computed through the store's own funnel engine from the decisions, pass manifests, approvals, and records already on disk.</p>
+
+<h3>Cumulative stages</h3>
+<table>
+  <tr><th>Stage</th><th>Count</th><th>Meaning</th></tr>
+  {% for row in view.stage_rows %}
+  <tr>
+    <td>{{ row.stage }}</td>
+    <td><strong>{{ row.count }}</strong></td>
+    <td class="muted">{{ row.meaning }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% if view.decisions_without_manifest %}
+<p class="pending">decisions without a finished pass manifest: {{ view.decisions_without_manifest }} (crash window before the manifest write)</p>
+{% endif %}
+
+<h3>Decision reasons by stage</h3>
+<p class="muted">Machine-checked vocabulary, zero-filled — a stage and label with no decisions reads as zero, not as a missing row.</p>
+<table>
+  <tr><th>Stage</th><th>Reason label</th><th>Count</th></tr>
+  {% for row in view.reasons %}
+  <tr>
+    <td><code>{{ row.stage }}</code></td>
+    <td><code>{{ row.label }}</code></td>
+    <td>{{ row.count }}</td>
+  </tr>
+  {% endfor %}
+</table>
+
+<h3>Per-pass funnels</h3>
+{% if view.passes %}
+<table>
+  <tr><th>Pass</th><th>Started</th><th>Finished</th><th>Candidates</th><th>Decisions</th><th>Replay-cleared</th><th>Materiality-cleared</th><th>Approved</th><th>Promoted</th><th>Gate errors</th></tr>
+  {% for row in view.passes %}
+  <tr>
+    <td><code>{{ row.pass_id }}</code></td>
+    <td class="muted">{{ row.started_at or "—" }}</td>
+    <td class="muted">{{ row.finished_at or "—" }}</td>
+    <td>{{ row.candidates }}</td>
+    <td>{{ row.decisions }}</td>
+    <td>{{ row.replay_cleared }}</td>
+    <td>{{ row.materiality_cleared }}</td>
+    <td>{{ row.approved }}</td>
+    <td>{{ row.promoted }}</td>
+    <td>{{ row.gate_errors }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<p class="empty">No passes recorded — there are no pass manifests under <code>passes/</code>, so there is no per-pass funnel to show.</p>
+{% endif %}
+
+<h3>Live run token evidence</h3>
+{% if view.live_tokens %}
+<p>{{ view.live_tokens.call_records }} call record(s): {{ view.live_tokens.ok }} ok, {{ view.live_tokens.failed }} failed.</p>
+<p>Tokens: {{ view.live_tokens.input_tokens }} in / {{ view.live_tokens.output_tokens }} out</p>
+{% if view.live_tokens.by_model %}
+<table>
+  <tr><th>Model</th><th>Calls</th><th>Input tokens</th><th>Output tokens</th></tr>
+  {% for model, summary in view.live_tokens.by_model | dictsort %}
+  <tr>
+    <td><code>{{ model }}</code></td>
+    <td>{{ summary.calls }}</td>
+    <td>{{ summary.input_tokens }}</td>
+    <td>{{ summary.output_tokens }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+{% if view.live_tokens.unreadable_records %}
+<p class="pending">unreadable call records (shown, not hidden): {{ view.live_tokens.unreadable_records }}</p>
+{% endif %}
+{% else %}
+<p class="empty">Live run token evidence: none found (no per-call token records under <code>runs/</code>).</p>
+{% endif %}
+{% endblock %}

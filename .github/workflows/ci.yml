@@ -152,5 +152,5 @@ jobs:
       # package's own requirement from the V3 verification matrix.
       - name: Console route tests with package coverage floor
         run: >
-          pytest tests/test_console.py -q --cov=evogine.console
-          --cov-report=term-missing --cov-fail-under=90
+          pytest tests/test_console.py tests/test_console_funnel.py -q
+          --cov=evogine.console --cov-report=term-missing --cov-fail-under=90

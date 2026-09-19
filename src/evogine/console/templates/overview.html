@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}Overview · Evogine Console{% endblock %}
+{% block content %}
+<h2>Overview</h2>
+<p>
+  {{ counts.total_decisions }} promotion decision(s) &middot;
+  {{ counts.promoted }} cleared for promotion &middot;
+  {{ counts.pending_approvals }} approval(s) pending — <a href="/approvals">open the queue</a>.
+</p>
+<table>
+  <tr><th>Gate stage</th><th>Decisions</th></tr>
+  {% for stage, count in counts.by_stage.items() %}<tr><td>{{ stage }}</td><td>{{ count }}</td></tr>{% endfor %}
+  <tr><th>Total</th><th>{{ counts.total_decisions }}</th></tr>
+</table>
+<p class="muted">Counts by stage match <code>evogine decisions report --root {{ root }}</code> for this store.</p>
+{% endblock %}

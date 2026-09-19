@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block title %}Not available · Evogine Console{% endblock %}
+{% block content %}
+<h2>{{ status }} — this view refuses to render</h2>
+<p class="error">{{ message }}</p>
+<p>
+  The console renders only what the store on disk actually contains. When a
+  request cannot be answered from the store's files — an unknown proposal id,
+  a malformed telemetry record — it shows this refusal instead of guessing.
+</p>
+<p><a href="/">Back to overview</a></p>
+{% endblock %}

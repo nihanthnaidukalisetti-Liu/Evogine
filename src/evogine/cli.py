@@ -49,6 +49,7 @@ from evogine.bench.harness import REPEAT_FLOOR, BenchHarness
 from evogine.bench.rundirs import RunCompleteError
 from evogine.bench.runner import KnowledgeRunner
 from evogine.bench.shadow import ShadowRefusalError, load_shadow_candidate, run_shadow_pass
+from evogine.console.launch import ConsoleError
 from evogine.engine.store import Engine, StoreError
 from evogine.gates.approvals import (
     ApprovalError,
@@ -182,6 +183,25 @@ def main(argv: list[str] | None = None) -> int:
         "--root", default=".", help="engine store root (default: .)"
     )
 
+    console_parser = subparsers.add_parser(
+        "console",
+        help="localhost operator console over existing telemetry (read-only; [console] extra)",
+    )
+    console_parser.add_argument("--root", required=True, help="engine store root to read")
+    console_parser.add_argument(
+        "--operator",
+        required=True,
+        help='operator identity shown on the console, e.g. "Nihanth <nihanth@example.eg>"',
+    )
+    console_parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="bind host; loopback only, anything else is refused (default: 127.0.0.1)",
+    )
+    console_parser.add_argument(
+        "--port", type=int, default=8765, help="bind port (default: 8765)"
+    )
+
     args = parser.parse_args(argv)
     if args.command == "run":
         return _run(args.root, repeats=args.repeats)
@@ -208,6 +228,8 @@ def main(argv: list[str] | None = None) -> int:
         return _approvals_decide(
             args.root, args.proposal_id, decided_by=args.by, reason=args.reason, reject=True
         )
+    if args.command == "console":
+        return _console(args.root, args.operator, host=args.host, port=args.port)
     return 0  # unreachable: subcommands are required
 
 
@@ -451,6 +473,29 @@ def _render_funnel_table(report: FunnelReport, root: str) -> str:
                 f"  unreadable call records (shown, not hidden): {live.unreadable_records}"
             )
     return "\n".join(lines)
+
+
+def _console(root: str, operator: str, *, host: str, port: int) -> int:
+    """Serve the operator console; web dependencies live behind the [console] extra.
+
+    The import is lazy so the core install never loads FastAPI or uvicorn:
+    ``evogine console`` without the extra installed refuses with a visible
+    instruction rather than crashing on an ImportError.
+    """
+    try:
+        from evogine.console.server import serve
+    except ModuleNotFoundError as exc:  # fastapi/uvicorn absent
+        print(
+            f"error: the console needs the optional web dependencies: "
+            f"pip install 'evogine[console]' ({exc})",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        return serve(root, operator, host=host, port=port)
+    except ConsoleError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
 
 def _approvals_list(root: str) -> int:

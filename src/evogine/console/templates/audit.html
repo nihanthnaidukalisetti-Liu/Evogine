@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}Audit · Evogine Console{% endblock %}
+{% block content %}
+<h2>Audit timeline</h2>
+<p class="muted">Append-only <code>audit.jsonl</code> for this store, newest event first. Every status transition the engine has recorded appears here; the console never writes to this log.</p>
+{% if empty %}
+<p class="empty">The audit log is empty — no lifecycle events have been recorded in this store yet.</p>
+{% else %}
+<table>
+  <tr><th>#</th><th>When</th><th>Event</th><th>Record</th><th>Status</th><th>Reason</th><th>Run ids</th></tr>
+  {% for row in rows %}
+  <tr>
+    <td>{{ row.seq }}</td>
+    <td class="muted">{{ row.ts or "—" }}</td>
+    <td><code>{{ row.event }}</code></td>
+    <td><code>{{ row.record_id }}</code></td>
+    <td>{% if row.from_status %}{{ row.from_status }} → {% endif %}<strong>{{ row.to_status }}</strong></td>
+    <td>{{ row.reason or "—" }}</td>
+    <td>{% for run_id in row.run_ids %}<code>{{ run_id }}</code>{% if not loop.last %}, {% endif %}{% else %}<span class="muted">—</span>{% endfor %}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}Evogine Console{% endblock %}</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 0; background: #f6f7f9; color: #1a1d21; }
+  header { background: #101828; color: #fff; padding: 0.75rem 1.25rem; display: flex; flex-wrap: wrap; gap: 0.35rem 1.5rem; align-items: baseline; }
+  header h1 { font-size: 1rem; margin: 0; }
+  header .meta { font-size: 0.8rem; color: #cbd5e1; }
+  nav { background: #1d2939; padding: 0.45rem 1.25rem; display: flex; gap: 1.1rem; }
+  nav a { color: #e2e8f0; text-decoration: none; font-size: 0.9rem; }
+  nav a:hover { text-decoration: underline; }
+  main { padding: 1.25rem; max-width: 72rem; margin: 0 auto; }
+  h2 { font-size: 1.05rem; margin: 0 0 0.75rem; }
+  h3 { font-size: 0.95rem; margin: 1.4rem 0 0.5rem; }
+  table { border-collapse: collapse; width: 100%; background: #fff; border: 1px solid #e2e6ea; }
+  th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid #eef0f2; vertical-align: top; font-size: 0.88rem; }
+  th { background: #eef1f4; font-weight: 600; }
+  code, pre { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 0.82rem; }
+  pre { background: #f1f3f6; padding: 0.5rem; overflow-x: auto; margin: 0.25rem 0; white-space: pre-wrap; word-break: break-word; }
+  .pill { border-radius: 999px; padding: 0.05rem 0.55rem; font-size: 0.78rem; border: 1px solid currentColor; white-space: nowrap; }
+  .pending { color: #b54708; }
+  .pass { color: #067647; } .fail { color: #b42318; }
+  .muted { color: #667085; }
+  .empty { color: #667085; font-style: italic; padding: 0.75rem 0; }
+  .error { color: #b42318; }
+  footer { color: #98a2b3; font-size: 0.78rem; padding: 0.75rem 1.25rem; }
+  a { color: #175cd3; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Evogine Console</h1>
+  <span class="meta">root: <code>{{ root }}</code></span>
+  <span class="meta">operator: {{ operator }}</span>
+</header>
+<nav>
+  <a href="/">Overview</a>
+  <a href="/decisions">Decisions</a>
+  <a href="/approvals">Approvals</a>
+  <a href="/audit">Audit</a>
+</nav>
+<main>
+{% block content %}{% endblock %}
+</main>
+<footer>read-only &middot; loopback only &middot; no auth stack (local operator console, V3 spec W1)</footer>
+</body>
+</html>

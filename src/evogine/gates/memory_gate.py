@@ -33,7 +33,6 @@ the store: rejected knowledge remains auditable, never deleted.
 from __future__ import annotations
 
 import inspect
-import json
 import os
 from datetime import UTC, datetime
 
@@ -51,6 +50,8 @@ from evogine.gates.telemetry import (
     ID_PATTERN,
     DecisionLog,
     DecisionStage,
+    PassDecisionSummary,
+    PassManifest,
     PromotionDecision,
     RunsEvidenceSink,
     TelemetryError,
@@ -391,28 +392,26 @@ def run_promotion_pass(engine: Engine, gate: MemoryGate) -> list[PromotionDecisi
     counts: dict[str, int] = {}
     for decision in decisions:
         counts[decision.stage.value] = counts.get(decision.stage.value, 0) + 1
-    manifest = {
-        "pass_id": pass_id,
-        "started_at": started_at.isoformat(),
-        "finished_at": datetime.now(UTC).isoformat(),
-        "candidates": [record.id for record in candidates],
-        "decisions": [
-            {
-                "proposal_id": decision.proposal_id,
-                "stage": decision.stage.value,
-                "promoted": decision.promoted,
-                "review_latency_seconds": decision.review_latency_seconds,
-            }
+    manifest = PassManifest(
+        pass_id=pass_id,
+        started_at=started_at,
+        finished_at=datetime.now(UTC),
+        candidates=[record.id for record in candidates],
+        decisions=[
+            PassDecisionSummary(
+                proposal_id=decision.proposal_id,
+                stage=decision.stage,
+                promoted=decision.promoted,
+                review_latency_seconds=decision.review_latency_seconds,
+            )
             for decision in decisions
         ],
-        "counts_by_stage": counts,
-    }
+        counts_by_stage=counts,
+    )
     passes_dir = store_root / "passes"
     passes_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = passes_dir / f"{pass_id}.json"
     tmp = manifest_path.with_suffix(".json.tmp")
-    tmp.write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    tmp.write_text(manifest.model_dump_json(indent=2) + "\n", encoding="utf-8")
     os.replace(tmp, manifest_path)
     return decisions

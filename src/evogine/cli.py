@@ -3,7 +3,13 @@
 Subcommands grow with the engine. ``decisions report`` renders promotion
 telemetry — decision counts by gate stage — from a store root's decision
 log, so the 0/11-style silent failures of V1 cannot happen again: every
-decided proposal's verdict is aggregated here. ``approvals`` is the
+decided proposal's verdict is aggregated here. ``decisions funnel`` (V3)
+aggregates the same records into the proposal-quality funnel — candidates
+→ replay-cleared → materiality-cleared → approved → promoted, per pass and
+cumulatively, with the refusal-reason breakdown over the machine-checked
+vocabulary and live-run token evidence when recorded — from files that
+already exist (decisions, pass manifests, approvals, records).
+``approvals`` is the
 human-approval promotion boundary (V2-6): the memory gate renders
 promotion proposals into the store's approval log, and
 ``approvals list|approve|reject`` is how a person reviews and decides
@@ -34,6 +40,8 @@ import json
 import sys
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from evogine import __version__
 from evogine.bench.cases import BenchCase, default_corpus
 from evogine.bench.gate_replay import HarnessReplayRunner
@@ -49,8 +57,14 @@ from evogine.gates.approvals import (
     approve_proposal,
     reject_proposal,
 )
+from evogine.gates.funnel import FunnelReport, build_funnel_report
 from evogine.gates.memory_gate import MemoryGate, run_promotion_pass
-from evogine.gates.telemetry import DecisionLog, DecisionStage, RunsEvidenceSink
+from evogine.gates.telemetry import (
+    DecisionLog,
+    DecisionStage,
+    RunsEvidenceSink,
+    TelemetryError,
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -116,6 +130,18 @@ def main(argv: list[str] | None = None) -> int:
         default=".",
         help="engine store root holding the decisions/ log (default: .)",
     )
+    funnel_parser = decisions_subparsers.add_parser(
+        "funnel",
+        help="proposal-quality funnel per pass, with refusal reasons and live tokens",
+    )
+    funnel_parser.add_argument(
+        "--root",
+        default=".",
+        help="engine store root holding the decisions/ log (default: .)",
+    )
+    funnel_parser.add_argument(
+        "--format", choices=["table", "json"], default="table", dest="format"
+    )
 
     approvals_parser = subparsers.add_parser(
         "approvals", help="human-approval promotion boundary (V2-6)"
@@ -170,6 +196,8 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.command == "decisions" and args.decisions_command == "report":
         return _decisions_report(args.root)
+    if args.command == "decisions" and args.decisions_command == "funnel":
+        return _decisions_funnel(args.root, as_json=args.format == "json")
     if args.command == "approvals" and args.approvals_command == "list":
         return _approvals_list(args.root)
     if args.command == "approvals" and args.approvals_command == "approve":
@@ -326,6 +354,103 @@ def _decisions_report(root: str) -> int:
     promoted = sum(1 for decision in decisions if decision.promoted)
     print(f"promoted: {promoted}")
     return 0
+
+
+def _decisions_funnel(root: str, *, as_json: bool) -> int:
+    """Render the proposal-quality funnel; corrupt telemetry exits non-zero."""
+    try:
+        report = build_funnel_report(root)
+    except (TelemetryError, ValidationError) as exc:
+        # Store-owned telemetry (decisions, manifests, approvals) is versioned
+        # evidence: a malformed file is a store defect, reported — never
+        # silently skipped, which would understate the funnel.
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if as_json:
+        print(report.model_dump_json(indent=2))
+        return 0
+    print(_render_funnel_table(report, root))
+    return 0
+
+
+def _render_funnel_table(report: FunnelReport, root: str) -> str:
+    """Human-readable funnel: cumulative stages, reasons, passes, live tokens."""
+    lines: list[str] = []
+    counts = report.funnel
+    lines.append(f"proposal funnel: {root}")
+    lines.append(f"  candidates:          {counts.candidates}  decided proposals (latest verdict each)")
+    lines.append(
+        f"  replay-cleared:      {counts.replay_cleared}  replay flipped a verdict"
+    )
+    lines.append(
+        f"  materiality-cleared: {counts.materiality_cleared}  flip met the materiality threshold"
+    )
+    lines.append(
+        f"  approved:            {counts.approved}  human approved (or applied) the proposal"
+    )
+    lines.append(
+        f"  promoted:            {counts.promoted}  live in the promoted pool"
+    )
+    lines.append(
+        f"  gate errors:         {counts.gate_errors}  infrastructure — undecided, retryable"
+    )
+    lines.append(
+        f"  proposals pending:   {counts.proposals_pending}  awaiting a human decision"
+    )
+    lines.append(
+        f"  proposals rejected:  {counts.proposals_rejected}  refused at the approval boundary"
+    )
+    if report.decisions_without_manifest:
+        lines.append(
+            f"  decisions without a finished pass manifest: "
+            f"{report.decisions_without_manifest} (crash window before the manifest write)"
+        )
+    lines.append("")
+    lines.append("decision reasons by stage (machine-checked vocabulary, zero-filled):")
+    for stage_value, labels in report.reasons_by_stage.items():
+        lines.append(f"  {stage_value}:")
+        for label, count in labels.items():
+            lines.append(f"    {label}: {count}")
+    lines.append("")
+    if report.passes:
+        lines.append(f"passes: {len(report.passes)}")
+        for entry in report.passes:
+            lines.append(f"  {entry.pass_id}:")
+            lines.append(
+                f"    candidates: {entry.candidates}, decisions: {entry.decisions}"
+            )
+            lines.append(
+                f"    replay-cleared: {entry.replay_cleared}, "
+                f"materiality-cleared: {entry.materiality_cleared}"
+            )
+            lines.append(
+                f"    approved: {entry.approved}, promoted: {entry.promoted}, "
+                f"gate errors: {entry.gate_errors}"
+            )
+    else:
+        lines.append("passes: none recorded (no pass manifests under passes/)")
+    lines.append("")
+    live = report.live_tokens
+    if live is None:
+        lines.append(
+            "live run token evidence: none found (no per-call token records under <root>/runs)"
+        )
+    else:
+        lines.append(
+            f"live run token evidence: {live.call_records} call record(s), "
+            f"{live.ok} ok, {live.failed} failed"
+        )
+        lines.append(f"  tokens: {live.input_tokens} in / {live.output_tokens} out")
+        for model, summary in sorted(live.by_model.items()):
+            lines.append(
+                f"  {model}: {summary.calls} call(s), "
+                f"{summary.input_tokens} in / {summary.output_tokens} out"
+            )
+        if live.unreadable_records:
+            lines.append(
+                f"  unreadable call records (shown, not hidden): {live.unreadable_records}"
+            )
+    return "\n".join(lines)
 
 
 def _approvals_list(root: str) -> int:

@@ -76,6 +76,33 @@ class PromotionDecision(BaseModel):
     before the gate decided it. ``None`` only when unknown (legacy files)."""
 
 
+class PassDecisionSummary(BaseModel):
+    """One decided proposal as summarized inside a pass manifest (V3)."""
+
+    proposal_id: str
+    stage: DecisionStage
+    promoted: bool
+    review_latency_seconds: float | None = None
+
+
+class PassManifest(BaseModel):
+    """What one promotion pass ran and decided — ``passes/<pass_id>.json``.
+
+    Written by :func:`run_promotion_pass` only after every candidate is
+    decided, so an absent manifest means the pass did not finish, never
+    that it decided nothing. The funnel report reads these manifests back
+    through this same model: one schema for the writer and the reader,
+    so the per-pass view cannot drift from what the pass actually wrote.
+    """
+
+    pass_id: str
+    started_at: datetime
+    finished_at: datetime
+    candidates: list[str] = Field(default_factory=list)
+    decisions: list[PassDecisionSummary] = Field(default_factory=list)
+    counts_by_stage: dict[str, int] = Field(default_factory=dict)
+
+
 class TelemetryError(ValueError):
     """A decision record violates the template-checked reason vocabulary."""
 
@@ -91,6 +118,11 @@ _STAGE_REASON_LABELS: dict[DecisionStage, frozenset[str]] = {
     DecisionStage.APPROVAL: frozenset({"proposed", "refused_no_evidence"}),
     DecisionStage.GATE_ERROR: frozenset({"gate_error"}),
 }
+
+#: Public alias so report surfaces (the decisions-funnel CLI, the console
+#: panel) aggregate the one machine-checked vocabulary instead of drifting
+#: into private copies — same pattern as ID_PATTERN below.
+STAGE_REASON_LABELS = _STAGE_REASON_LABELS
 
 _REASON_PATTERNS: dict[str, re.Pattern[str]] = {
     "no_flip": re.compile(r"no_flip: \d+/\d+ replays changed verdict"),

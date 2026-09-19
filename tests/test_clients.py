@@ -10,7 +10,7 @@ import json
 import threading
 import time
 from collections.abc import Iterator
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 from pydantic import ValidationError
@@ -41,15 +41,16 @@ def _error_body(type_: str, message: str) -> dict[str, object]:
     return {"type": "error", "error": {"type": type_, "message": message}}
 
 
-class _StubServer(ThreadingHTTPServer):
-    """Gate-container-tolerant stub server.
+class _StubServer(HTTPServer):
+    """Deliberately single-threaded stub server.
 
-    The CI gate container runs suites under tight process limits; a larger
-    listen backlog keeps loaded runs from refusing connections that arrive
-    while previous connection threads are still being reaped.
+    The CI gate container runs suites under tight process limits and denies
+    per-connection thread spawns under load ("can't start new thread"),
+    which surfaces client-side as connection errors instead of the scripted
+    responses. A sequential server needs one thread total (serve_forever);
+    concurrent arrivals queue in the (generous) listen backlog instead.
     """
 
-    daemon_threads = True
     request_queue_size = 64
 
 
@@ -247,6 +248,13 @@ def test_timeout_is_transient_and_retried(stub_api: StubAnthropicAPI) -> None:
     with pytest.raises(ModelTransientError, match="timed out"):
         client.complete(ModelRequest(system="s", user="u"))
 
+    # The retry contract is pinned client-side above; this assertion only
+    # checks both attempts reached the stub, and with a sequential stub the
+    # second request is read after the first handler's scripted delay drains,
+    # so wait (bounded) instead of assuming instant server-side visibility.
+    deadline = time.monotonic() + 5.0
+    while len(stub_api.requests()) < 2 and time.monotonic() < deadline:
+        time.sleep(0.02)
     assert len(stub_api.requests()) == 2  # both attempts reached the stub
 
 

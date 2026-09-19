@@ -228,3 +228,6 @@ Every claim above, as it lives in the source at `d2ab240`:
 | Duplicate detection is per-pool | `Engine.find_duplicates` — `store.py` |
 | Single-object retrieval seam | `retrieve(store, …)` — `retrieval.py` |
 | The only "scope" today is budget accounting | `BudgetScope` — `src/evogine/bench/budgets.py` |
+| Export bundle: manifest + payloads, provenance verbatim, lineage qualified once | `export_bundle`, `read_bundle`, `write_bundle` — `src/evogine/engine/transfer.py` |
+| Human-reviewed import: dry-run preview, explicit `--yes`, candidate-only landing | `import_preview`, `apply_import` — `transfer.py`; `Engine.import_candidate` — `store.py`; `evogine memory export\|import` — `cli.py` |
+| Destination-clock decay stamping on landed records, audit-referenced | `Engine.import_candidate` (confidence stamp + import audit event) — `store.py` |

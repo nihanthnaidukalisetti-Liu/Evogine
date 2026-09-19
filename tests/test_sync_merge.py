@@ -12,6 +12,7 @@ driver wired via ``.gitattributes``.
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,18 @@ BASE = '{"seq":1,"event":"propose","record_id":"lr-1"}\n'
 OURS_APPEND = '{"seq":2,"event":"propose","record_id":"lr-ours"}\n'
 THEIRS_APPEND = '{"seq":3,"event":"propose","record_id":"lr-theirs"}\n'
 
+# The driver command is environment-proof: it re-injects PYTHONPATH pointing
+# at this checkout's src/ tree and uses the running interpreter explicitly.
+# Git-spawned merge drivers run with the REPO's working directory, so a bare
+# `python3 -m evogine.sync.merge` loses the candidate tree whenever the
+# ambient environment does not already carry an importable evogine (the
+# hermetic evaluator runs the suite uninstalled, imports resolved via
+# PYTHONPATH) — the driver then dies with ModuleNotFoundError and git
+# reports a bare conflict. sys.executable is the same interpreter running
+# the tests; SRC is this checkout's source root in any staging layout.
+SRC = Path(__file__).resolve().parents[1] / "src"
+DRIVER = f"env PYTHONPATH={SRC} {sys.executable} -m evogine.sync.merge %O %A %B"
+
 
 def test_disjoint_appends_keep_each_sides_order() -> None:
     merged = merge_audit_lines(BASE, BASE + OURS_APPEND, BASE + THEIRS_APPEND)
@@ -30,14 +43,15 @@ def test_disjoint_appends_keep_each_sides_order() -> None:
 
 
 def test_duplicate_append_appears_once() -> None:
-    merged = merge_audit_lines(
-        BASE, BASE + OURS_APPEND, BASE + OURS_APPEND + THEIRS_APPEND
-    )
+    merged = merge_audit_lines(BASE, BASE + OURS_APPEND, BASE + OURS_APPEND + THEIRS_APPEND)
     assert merged == BASE + OURS_APPEND + THEIRS_APPEND
 
 
 def test_identical_sides_are_stable() -> None:
-    assert merge_audit_lines(BASE + OURS_APPEND, BASE + OURS_APPEND, BASE + OURS_APPEND) == BASE + OURS_APPEND
+    assert (
+        merge_audit_lines(BASE + OURS_APPEND, BASE + OURS_APPEND, BASE + OURS_APPEND)
+        == BASE + OURS_APPEND
+    )
 
 
 @pytest.mark.parametrize("side", ["ours", "theirs"])
@@ -71,7 +85,14 @@ def test_cli_refuses_rewrite_with_visible_error(tmp_path: Path, capsys) -> None:
 
 
 def _git(*args: str, cwd: Path) -> None:
-    subprocess.run(["git", *args], cwd=cwd, capture_output=True, check=True)
+    proc = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=False)
+    if proc.returncode:
+        # Surface git's own output — a failed merge driver's stderr reaches
+        # us only through here, and a bare rc hides the actual cause.
+        raise AssertionError(
+            f"git {' '.join(args)} failed with exit {proc.returncode}\n"
+            f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+        )
 
 
 def _commit_all(cwd: Path, message: str) -> None:
@@ -89,7 +110,7 @@ def test_real_git_merge_wires_the_driver(tmp_path: Path) -> None:
     _git(
         "config",
         "merge.evogine-audit.driver",
-        "python3 -m evogine.sync.merge %O %A %B",
+        DRIVER,
         cwd=repo,
     )
     (repo / ".gitattributes").write_text("audit.jsonl merge=evogine-audit\n", encoding="utf-8")
@@ -121,7 +142,7 @@ def test_real_git_merge_keeps_history_rewrite_visible(tmp_path: Path) -> None:
     _git(
         "config",
         "merge.evogine-audit.driver",
-        "python3 -m evogine.sync.merge %O %A %B",
+        DRIVER,
         cwd=repo,
     )
     (repo / ".gitattributes").write_text("audit.jsonl merge=evogine-audit\n", encoding="utf-8")

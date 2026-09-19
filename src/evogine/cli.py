@@ -21,32 +21,63 @@ gate to the bench-backed replay runner (HarnessReplayRunner) with the
 offline KnowledgeRunner, decides every candidate learning, records one
 telemetry decision per proposal, and renders approval proposals — exiting
 non-zero when any gate-error decision was made. ``bench`` runs the
-warm-vs-cold harness over the default corpus with the same offline runner
-and reports pass rates; it is informational and always exits zero when the
-run completes. ``shadow`` (V3 W2) profiles a candidate retrieval
-configuration over that corpus without touching lifecycle state: the store
-is handed over through a read-only seam, results land only under
-``runs/shadow/<candidate_id>/``, and a contaminated or over-ceiling run is
-refused before anything is evaluated — exiting non-zero with $0 spent.
-Both operate on an explicit ``--root``: they create or read
-a store, and silently defaulting to the working directory could benchmark
-or mutate the wrong store (git-safety).
+warm-vs-cold harness over the default corpus and reports pass rates; it is
+informational and always exits zero when the run completes.
+
+``bench --runner live`` is the V3 W0 spend seam: it drives the swarm model
+client for real, so its gates are checked before anything else — a
+pre-registered protocol (``--protocol``) and a configured provider key are
+required, and pre-run validation fails closed: a projected spend over the
+dollar ceiling, a repeat count below the floor, or a contaminated holdout
+(the retrieval-only recall probe runs first, before any client exists)
+each refuse the run before the first dollar is spent. ``shadow`` (V3 W2)
+profiles a candidate retrieval configuration over that corpus without
+touching lifecycle state: the store is handed over through a read-only
+seam, results land only under ``runs/shadow/<candidate_id>/``, and a
+contaminated or over-ceiling run is refused before anything is evaluated —
+exiting non-zero with $0 spent. Both operate on an explicit ``--root``:
+they create or read a store, and silently defaulting to the working
+directory could benchmark or mutate the wrong store (git-safety).
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
 from pydantic import ValidationError
 
 from evogine import __version__
+from evogine.bench.budgets import (
+    DollarBudget,
+    SpendCeilingExceededError,
+    SpendReconciliation,
+    queue_spend,
+    reconcile_spend,
+)
 from evogine.bench.cases import BenchCase, default_corpus
 from evogine.bench.gate_replay import HarnessReplayRunner
-from evogine.bench.harness import REPEAT_FLOOR, BenchHarness
-from evogine.bench.rundirs import RunCompleteError
+from evogine.bench.harness import (
+    REPEAT_FLOOR,
+    BenchHarness,
+    CaseRunner,
+    RunArtifacts,
+    refuse_contaminated_holdout,
+)
+from evogine.bench.live import LiveCaseRunner, read_call_records
+from evogine.bench.probes import ContaminationError
+from evogine.bench.prompts import DEFAULT_PROMPT_PACK
+from evogine.bench.protocol import (
+    EvalProtocol,
+    ProtocolValidationError,
+    load_protocol,
+    pre_run_validate,
+)
+from evogine.bench.replay import ReplaySchedule, build_replay_requests
+from evogine.bench.rundirs import RunCompleteError, open_run
 from evogine.bench.runner import KnowledgeRunner
 from evogine.bench.shadow import ShadowRefusalError, load_shadow_candidate, run_shadow_pass
 from evogine.console.launch import ConsoleError
@@ -66,6 +97,10 @@ from evogine.gates.telemetry import (
     RunsEvidenceSink,
     TelemetryError,
 )
+from evogine.swarm.clients import AnthropicClient, ModelClient, RetryingModelClient
+
+DEFAULT_BENCH_REPEATS = 8
+"""The offline bench's repeat count when neither a flag nor a protocol pins one."""
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -96,10 +131,66 @@ def main(argv: list[str] | None = None) -> int:
     bench_parser.add_argument(
         "--repeats",
         type=int,
-        default=8,
-        help=f"repetitions per arm (floor: {REPEAT_FLOOR}; default: 8)",
+        default=None,
+        help=f"repetitions per arm (floor: {REPEAT_FLOOR}; default: {DEFAULT_BENCH_REPEATS}; "
+        "a protocol pins its own)",
     )
     bench_parser.add_argument("--format", choices=["table", "json"], default="table", dest="format")
+    bench_parser.add_argument(
+        "--runner",
+        choices=["offline", "live"],
+        default="offline",
+        dest="runner",
+        help="case runner: offline composes submissions from store knowledge (default); "
+        "live drives the swarm model client and is protocol-gated",
+    )
+    bench_parser.add_argument(
+        "--protocol",
+        default=None,
+        help="pre-registered protocol YAML pinning the run (required for --runner live)",
+    )
+    bench_parser.add_argument(
+        "--model", default=None, help="provider model id (required for --runner live)"
+    )
+    bench_parser.add_argument(
+        "--max-cost-usd",
+        default=None,
+        dest="max_cost_usd",
+        help="live run spend ceiling in USD (default: 25.00)",
+    )
+    bench_parser.add_argument(
+        "--expected-input-tokens",
+        type=int,
+        default=None,
+        dest="expected_input_tokens",
+        help="expected input tokens per replay (live; required so the ceiling cannot project zero)",
+    )
+    bench_parser.add_argument(
+        "--expected-output-tokens",
+        type=int,
+        default=None,
+        dest="expected_output_tokens",
+        help="expected output tokens per replay (live; required so the ceiling cannot project zero)",
+    )
+    bench_parser.add_argument(
+        "--input-price-per-mtok-usd",
+        default=None,
+        dest="input_price_per_mtok_usd",
+        help="input price per million tokens in USD (live; required)",
+    )
+    bench_parser.add_argument(
+        "--output-price-per-mtok-usd",
+        default=None,
+        dest="output_price_per_mtok_usd",
+        help="output price per million tokens in USD (live; required)",
+    )
+
+    bench_parser.add_argument(
+        "--run-id",
+        default=None,
+        dest="run_id",
+        help="resume a specific run directory instead of starting a fresh one",
+    )
 
     shadow_parser = subparsers.add_parser(
         "shadow",
@@ -206,7 +297,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "run":
         return _run(args.root, repeats=args.repeats)
     if args.command == "bench":
-        return _bench(args.root, repeats=args.repeats, as_json=args.format == "json")
+        return _bench(
+            args.root,
+            repeats=args.repeats,
+            as_json=args.format == "json",
+            runner_name=args.runner,
+            protocol_path=args.protocol,
+            run_id=args.run_id,
+            model=args.model,
+            max_cost_usd=args.max_cost_usd,
+            expected_input_tokens=args.expected_input_tokens,
+            expected_output_tokens=args.expected_output_tokens,
+            input_price_per_mtok_usd=args.input_price_per_mtok_usd,
+            output_price_per_mtok_usd=args.output_price_per_mtok_usd,
+        )
     if args.command == "shadow":
         return _shadow(
             args.root,
@@ -237,7 +341,13 @@ def _run(root: str, *, repeats: int) -> int:
     """Drive a full promotion pass; exit 2 on any gate-error decision."""
     engine = Engine(root)
     gate = MemoryGate(
-        runner=HarnessReplayRunner(engine, KnowledgeRunner(), corpus=None, repeats=repeats),
+        runner=HarnessReplayRunner(
+            engine,
+            KnowledgeRunner(),
+            corpus=None,
+            repeats=repeats,
+            runs_root=Path(root) / "runs" / "replay",
+        ),
         log=DecisionLog(root),
         approvals=ApprovalLog(root),
         evidence=RunsEvidenceSink(root),
@@ -270,17 +380,179 @@ def _run(root: str, *, repeats: int) -> int:
     return 0
 
 
-def _bench(root: str, *, repeats: int, as_json: bool) -> int:
-    """Run the warm-vs-cold harness over the default corpus; informational."""
+def _refuse(reason: str) -> int:
+    """Print a fail-closed refusal to stderr; every refusal spends nothing."""
+    print(f"error: {reason}", file=sys.stderr)
+    return 1
+
+
+def _resolve_provider_key() -> str | None:
+    """The configured provider key, or None when absent.
+
+    Read before any model call: the live path refuses to spend with no key
+    configured — a refusal is cheaper than a failed call.
+    """
+    value = os.environ.get("ANTHROPIC_API_KEY", "")
+    return value if value.strip() else None
+
+
+def _build_live_client(*, api_key: str, model: str) -> ModelClient:
+    """The live spend seam: bounded retries around one Anthropic-compatible provider."""
+    return RetryingModelClient(AnthropicClient(model=model, api_key=api_key))
+
+
+def _live_spend_plan(
+    *,
+    model: str | None,
+    expected_input_tokens: int | None,
+    expected_output_tokens: int | None,
+    input_price_per_mtok_usd: str | None,
+    output_price_per_mtok_usd: str | None,
+    max_cost_usd: str | None,
+) -> DollarBudget:
+    """Build the declared dollar budget for a live run, refusing gaps.
+
+    The spend expectation must be declared in full: an absent token or price
+    knob would project zero and silently disarm the dollar ceiling, so the
+    live path refuses rather than guessing. Pydantic coerces the declared
+    values and refuses negatives and unparseable prices.
+    """
+    required = {
+        "--model": model,
+        "--expected-input-tokens": expected_input_tokens,
+        "--expected-output-tokens": expected_output_tokens,
+        "--input-price-per-mtok-usd": input_price_per_mtok_usd,
+        "--output-price-per-mtok-usd": output_price_per_mtok_usd,
+    }
+    missing = [flag for flag, value in required.items() if value is None]
+    if missing:
+        raise ValueError(
+            f"--runner live requires {', '.join(missing)}: the spend expectation must be "
+            "declared in full — an absent knob would project zero and disarm the dollar ceiling"
+        )
+    fields: dict[str, object] = {
+        "expectation": {
+            "input_tokens": expected_input_tokens,
+            "output_tokens": expected_output_tokens,
+            "input_price_per_mtok_usd": input_price_per_mtok_usd,
+            "output_price_per_mtok_usd": output_price_per_mtok_usd,
+        },
+    }
+    if max_cost_usd is not None:
+        fields["max_run_cost_usd"] = max_cost_usd
+    return DollarBudget.model_validate(fields)
+
+
+def _bench(
+    root: str,
+    *,
+    repeats: int | None,
+    as_json: bool,
+    runner_name: str,
+    protocol_path: str | None,
+    run_id: str | None,
+    model: str | None,
+    max_cost_usd: str | None,
+    expected_input_tokens: int | None,
+    expected_output_tokens: int | None,
+    input_price_per_mtok_usd: str | None,
+    output_price_per_mtok_usd: str | None,
+) -> int:
+    """Run the warm-vs-cold harness; ``live`` is protocol-gated and fail-closed."""
+    if runner_name == "live" and protocol_path is None:
+        return _refuse(
+            "--runner live requires --protocol: the live path does not exist without a "
+            "pre-registered protocol (nothing was spent)"
+        )
+    if repeats is not None and repeats < REPEAT_FLOOR:
+        return _refuse(f"repeats={repeats} is below the {REPEAT_FLOOR}-repeat floor")
+
+    protocol: EvalProtocol | None = None
+    if protocol_path is not None:
+        try:
+            protocol = load_protocol(protocol_path)
+        except ValueError as exc:  # pydantic ValidationError subclasses ValueError
+            return _refuse(f"protocol {protocol_path} refused: {exc}")
+
     engine = Engine(root)
+    budget: DollarBudget | None = None
+    if runner_name == "live":
+        api_key = _resolve_provider_key()
+        if api_key is None:
+            return _refuse(
+                "--runner live requires a configured provider key (ANTHROPIC_API_KEY): "
+                "refusing before any model call (nothing was spent)"
+            )
+        assert protocol is not None  # the protocol-less live path refused above
+        try:
+            budget = _live_spend_plan(
+                model=model,
+                expected_input_tokens=expected_input_tokens,
+                expected_output_tokens=expected_output_tokens,
+                input_price_per_mtok_usd=input_price_per_mtok_usd,
+                output_price_per_mtok_usd=output_price_per_mtok_usd,
+                max_cost_usd=max_cost_usd,
+            )
+        except ValueError as exc:  # missing knobs, negatives, unparseable prices
+            return _refuse(str(exc))
+        if protocol.prompt_pack != DEFAULT_PROMPT_PACK.fingerprint:
+            return _refuse(
+                f"protocol pins prompt pack {protocol.prompt_pack!r} but this build's pack is "
+                f"{DEFAULT_PROMPT_PACK.fingerprint!r} — live spend only follows the pinned text"
+            )
+        corpus = default_corpus()
+        try:
+            check = pre_run_validate(protocol, corpus)
+            # The contamination probe runs FIRST: it is retrieval-only (free), and a
+            # holdout the store already quotes voids the run before any money moves.
+            refuse_contaminated_holdout(engine, check, corpus)
+            schedule = ReplaySchedule(
+                requests=build_replay_requests(list(check.cases), protocol.repeats)
+            )
+            queue_spend(schedule, budget)
+        except (ProtocolValidationError, ContaminationError, SpendCeilingExceededError) as exc:
+            return _refuse(str(exc))
+        assert model is not None  # refused above when absent
+        live_client: ModelClient | None = _build_live_client(api_key=api_key, model=model)
+    else:
+        live_client = None
+
+    # All refusals are done: open the run directory and persist evidence.
     try:
-        report = BenchHarness(engine, KnowledgeRunner()).run(repeats=repeats)
-    except (StoreError, ValueError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
+        run_dir = open_run(Path(root) / "runs" / "bench", run_id=run_id)
+    except ValueError as exc:  # includes RunCompleteError: completed runs are immutable
+        return _refuse(str(exc))
+    harness_runner: CaseRunner
+    if live_client is not None:
+        harness_runner = LiveCaseRunner(live_client, DEFAULT_PROMPT_PACK, run=run_dir)
+    else:
+        harness_runner = KnowledgeRunner()
+    harness_repeats = (
+        repeats
+        if protocol is not None
+        else (repeats if repeats is not None else DEFAULT_BENCH_REPEATS)
+    )
+    try:
+        report = BenchHarness(engine, harness_runner).run(
+            repeats=harness_repeats,
+            protocol=protocol,
+            artifacts=RunArtifacts(run_dir),
+        )
+        reconciliation: SpendReconciliation | None = None
+        if live_client is not None and budget is not None:
+            # Reconciled from the persisted per-call records — not the
+            # runner's memory — so a resumed run's report also accounts
+            # for every call loaded back from disk.
+            reconciliation = reconcile_spend(budget, read_call_records(run_dir))
+            run_dir.write_artifact("spend-report", reconciliation.model_dump_json(indent=2))
+        run_dir.mark_complete()
+    except (StoreError, ValueError, ProtocolValidationError, ContaminationError) as exc:
+        return _refuse(str(exc))
     summary = report.summary
     if as_json:
         payload = {
+            "run_id": run_dir.run_id,
+            "run_dir": str(run_dir.directory),
             "repeats": summary.repeats,
             "replays": summary.replays,
             "cold_pass_rate": summary.cold_pass_rate,
@@ -296,11 +568,23 @@ def _bench(root: str, *, repeats: int, as_json: bool) -> int:
                 for case_report in report.cases
             ],
         }
+        if reconciliation is not None:
+            payload["spend"] = reconciliation.model_dump(mode="json")
         print(json.dumps(payload, indent=2))
         return 0
+    runner_label = "live" if live_client is not None else "offline"
     print(
-        f"bench: {len(report.cases)} cases, {summary.replays} replays at {summary.repeats} repeats"
+        f"bench ({runner_label} runner): {len(report.cases)} cases, "
+        f"{summary.replays} replays at {summary.repeats} repeats"
     )
+    print(f"  run dir: {run_dir.directory}")
+    if reconciliation is not None:
+        print(
+            f"  spend: ${reconciliation.actual_cost_usd} of "
+            f"${reconciliation.ceiling_usd} ceiling over "
+            f"{reconciliation.recorded_calls} calls "
+            f"({reconciliation.calls_without_usage} without usage)"
+        )
     print(f"  cold pass rate: {summary.cold_pass_rate:.3f}")
     print(f"  warm pass rate: {summary.warm_pass_rate:.3f}")
     print(f"  mean delta:     {summary.mean_delta_pass_rate:+.3f}")

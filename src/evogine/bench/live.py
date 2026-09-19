@@ -174,10 +174,24 @@ class LiveCaseRunner:
             )
 
 
+def read_call_records(run_dir: RunDirectory) -> list[LiveCallRecord]:
+    """Load the persisted per-call records back out of a run directory.
+
+    Spend reconciliation reads these from disk — not from the runner's
+    memory — so the report also accounts for work loaded back from a
+    resumed run.
+    """
+    records: list[LiveCallRecord] = []
+    for path in sorted((run_dir.directory / "artifacts").glob("call-*.json")):
+        records.append(LiveCallRecord.model_validate_json(path.read_text(encoding="utf-8")))
+    return records
+
+
 __all__ = [
     "FAILURE_OUTPUT",
     "LiveCallRecord",
     "LiveCaseRunner",
+    "read_call_records",
 ]
 
 # Static protocol proof: mypy verifies LiveCaseRunner satisfies CaseRunner

@@ -12,16 +12,22 @@ pool plus the candidate, as it would be served if promoted).
 Verdicts pair per case instance across arms, so the gate's materiality stage
 aligns them by identity.
 
-The CLI's ``run`` subcommand wires this runner into the gate; the gate
-persists the paired verdicts through its own evidence sink, so no second
-file format is introduced here.
+With a ``runs_root`` configured (the CLI wires ``<root>/runs/replay``), each
+replay run also persists its own immutable run directory: per-outcome
+evidence from the harness, a ``replay-run`` descriptor naming the gate arm
+and learning, and the completion marker — the gate's replay evidence becomes
+resumable, inspectable evidence on disk.
 """
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 from evogine.bench.cases import BenchCase
-from evogine.bench.harness import BenchHarness, CaseRunner, Retriever
+from evogine.bench.harness import BenchHarness, CaseRunner, Retriever, RunArtifacts
 from evogine.bench.replay import REPEAT_FLOOR
+from evogine.bench.rundirs import RunDirectory, open_run
 from evogine.bench.shadow import OverlayRetriever
 from evogine.engine.store import Engine
 from evogine.gates.materiality import Verdict
@@ -56,11 +62,13 @@ class HarnessReplayRunner:
         *,
         corpus: list[BenchCase] | None = None,
         repeats: int = REPEAT_FLOOR,
+        runs_root: Path | None = None,
     ) -> None:
         self._engine = engine
         self._runner = runner
         self._corpus = corpus
         self._repeats = repeats
+        self._runs_root = runs_root
 
     def run(self, run_id: str) -> ReplayRun:
         for arm in _ARMS:
@@ -80,9 +88,32 @@ class HarnessReplayRunner:
                     overlay=[record],
                     embedder=self._engine.embedder,
                 )
+            gate_arm: Arm = "baseline" if arm == BASELINE_ARM else "warm"
+            run_dir: RunDirectory | None = None
+            artifacts: RunArtifacts | None = None
+            if self._runs_root is not None:
+                # A fresh uniquely-named directory per replay run: completed runs
+                # are immutable, and the gate re-reviews candidates on every pass,
+                # so deterministic ids would collide across invocations.
+                run_dir = open_run(self._runs_root)
+                artifacts = RunArtifacts(run_dir)
             report = BenchHarness(retriever, self._runner).run(
-                corpus=self._corpus, repeats=self._repeats
+                corpus=self._corpus, repeats=self._repeats, artifacts=artifacts
             )
+            if run_dir is not None:
+                # Descriptor first, completion marker last: an incomplete dir
+                # without the marker is resumable, a completed one immutable.
+                run_dir.write_artifact(
+                    "replay-run",
+                    json.dumps(
+                        {
+                            "replay_run_id": run_id,
+                            "gate_arm": gate_arm,
+                            "learning_id": learning_id,
+                        }
+                    ),
+                )
+                run_dir.mark_complete()
             verdicts = [
                 Verdict(
                     instance_id=f"{outcome.case_id}-r{outcome.repeat:02d}",
@@ -93,7 +124,6 @@ class HarnessReplayRunner:
                     case_report.cold.outcomes if arm == BASELINE_ARM else case_report.warm.outcomes
                 )
             ]
-            gate_arm: Arm = "baseline" if arm == BASELINE_ARM else "warm"
             return ReplayRun(run_id=run_id, arm=gate_arm, verdicts=verdicts)
         raise KeyError(
             f"malformed replay run id (expected {REPLAY_RUN_PREFIX}-<learning_id>-"

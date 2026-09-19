@@ -50,15 +50,37 @@ sync endpoints (forward-looking), and logging. The provider key is never
 stored in the file: it is read at run time from the environment variable
 named by `api_key_env`.
 
+## Documentation
+
+- [Quickstart](docs/quickstart.md) — from clone to first governed run:
+  `init`, `doctor`, a seeded candidate, an offline review, the approval,
+  and the audit trail. Every command executed against the real CLI.
+- [User guide](docs/user-guide.md) — store lifecycle, the approvals CLI,
+  retrieval and the honest empty state, memory gates and promotion, bench
+  protocols, the proposal funnel, and cross-project export/import.
+- [Operator runbook](docs/operator-runbook.md) — backup and restore,
+  schema migrations, compaction, sync daemon operation (loopback-first
+  binding, LAN read exposure and its limits), doctor checks, and logs.
+- [Architecture](docs/architecture.md) — the module map, the four
+  federation invariants, the LearningSink-mediated proposal flow, sync
+  transport, and the refusal-state vocabulary.
+- [Cross-project memory](docs/cross-project-memory.md) — the federation
+  governance record: the architecture fork, and the four invariants.
+
 ## Status
 
-The sandboxed code gate is implemented: candidate patches are staged
-traversal-safe, verified inside a locked-down Docker container (no network,
-pinned dependencies, capped resources, sanitized output, no inherited host
-environment), checked for differential equivalence (bytecode-verified when a
-refactor claim is made), and enforced never-worse across evaluated cases. The
-gate fails closed on its own crash, and Docker-gated probes skip cleanly where
-Docker is absent. Everything else remains v1 scaffold skeletons.
+Shipped on main: the git-backed learning store with promotion-only
+retrieval and the full record lifecycle; the sandboxed code gate
+(Docker-gated, fail-closed) and the memory gate behind the human-approval
+boundary; the offline warm-vs-cold bench plus protocol-gated live runs
+and non-mutating shadow passes; the proposal funnel over promotion
+telemetry; the localhost operator console with guarded approval write
+paths; federated memory with reviewed cross-project export/import; the
+git-native sync daemon (loopback-first binding, read/query API); the
+repository decomposer; and unified config with `init` and `doctor`. The
+swarm run CLI — driving builder/verifier/reflector over a repository
+task — is not on main yet. Details and the refusal-state vocabulary:
+[docs/architecture.md](docs/architecture.md).
 
 ## Spec
 

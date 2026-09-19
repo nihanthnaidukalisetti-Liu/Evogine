@@ -51,7 +51,7 @@ if TYPE_CHECKING:
 
     from evogine.engine.records import LearningRecord
 
-OPERATOR = "Nihanth <nihanth@localhost>"
+OPERATOR = "nihanth@localhost"
 
 #: The orphan pass id on the legacy decision: no manifest exists for it, so
 #: it is the crash-window gap the report must show, never absorb.

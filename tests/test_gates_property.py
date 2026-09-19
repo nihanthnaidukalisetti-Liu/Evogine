@@ -26,11 +26,10 @@ from __future__ import annotations
 
 import json
 import shutil
-import tempfile
 from pathlib import Path
 
 import pytest
-from conftest import make_record
+from conftest import make_record, temp_store_root
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
@@ -128,7 +127,7 @@ def test_no_interleaving_approves_without_pending_evidence_and_candidate(
     and a record on disk in ``promoted`` implies a successful approve call
     happened somewhere in the history.
     """
-    root = Path(tempfile.mkdtemp(prefix="evogine-approval-fuzz-"))
+    root = temp_store_root("evogine-approval-fuzz-")
     try:
         store = Engine(root)
         approvals = ApprovalLog(root)
@@ -186,7 +185,7 @@ def test_no_interleaving_approves_without_pending_evidence_and_candidate(
 
 def test_approve_refuses_a_proposal_that_lost_its_evidence() -> None:
     """Defense in depth: no evidence in the proposal file, no approval."""
-    root = Path(tempfile.mkdtemp(prefix="evogine-approval-evidence-"))
+    root = temp_store_root("evogine-approval-evidence-")
     try:
         store = Engine(root)
         approvals = ApprovalLog(root)
@@ -210,7 +209,7 @@ def test_approve_refuses_a_proposal_that_lost_its_evidence() -> None:
 
 def test_approve_refuses_when_the_record_lost_candidate() -> None:
     """No approval without a candidate: a direct demotion blocks the apply."""
-    root = Path(tempfile.mkdtemp(prefix="evogine-approval-candidate-"))
+    root = temp_store_root("evogine-approval-candidate-")
     try:
         store = Engine(root)
         approvals = ApprovalLog(root)
@@ -237,7 +236,7 @@ def test_interrupted_apply_leaves_the_least_privileged_visible_state() -> None:
     least-privileged one: the approval is visible in the log (never silent),
     while the store stays untouched at ``candidate``.
     """
-    root = Path(tempfile.mkdtemp(prefix="evogine-approval-crash-"))
+    root = temp_store_root("evogine-approval-crash-")
     try:
         store = Engine(root)
         approvals = ApprovalLog(root)
@@ -267,7 +266,7 @@ def test_interrupted_apply_leaves_the_least_privileged_visible_state() -> None:
 @pytest.mark.parametrize("decide_first", ["approve", "reject"])
 def test_decided_proposals_are_final_for_both_decisions(decide_first: str) -> None:
     """After either decision, both approve and reject are refused."""
-    root = Path(tempfile.mkdtemp(prefix="evogine-approval-final-"))
+    root = temp_store_root("evogine-approval-final-")
     try:
         store = Engine(root)
         approvals = ApprovalLog(root)
@@ -296,7 +295,7 @@ def test_decided_proposals_are_final_for_both_decisions(decide_first: str) -> No
 
 def test_rejection_requires_a_reason() -> None:
     """A blank reason is refused before anything is recorded."""
-    root = Path(tempfile.mkdtemp(prefix="evogine-approval-reason-"))
+    root = temp_store_root("evogine-approval-reason-")
     try:
         store = Engine(root)
         approvals = ApprovalLog(root)
@@ -323,7 +322,7 @@ def test_rereview_of_promoted_knowledge_cannot_repromote() -> None:
     re-rendered proposal is refused — the record is not a candidate — so
     the boundary never promotes the same knowledge twice.
     """
-    root = Path(tempfile.mkdtemp(prefix="evogine-approval-rereview-"))
+    root = temp_store_root("evogine-approval-rereview-")
     try:
         store = Engine(root)
         approvals = ApprovalLog(root)
@@ -365,7 +364,7 @@ def test_replay_infrastructure_failures_are_gate_errors_never_knowledge_verdicts
     record stays a candidate, and the decision is still recorded (the V2-1
     completeness invariant holds for errors too).
     """
-    root = Path(tempfile.mkdtemp(prefix="evogine-gate-error-"))
+    root = temp_store_root("evogine-gate-error-")
     try:
         store = Engine(root)
         approvals = ApprovalLog(root)

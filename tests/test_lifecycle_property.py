@@ -27,11 +27,10 @@ from __future__ import annotations
 
 import json
 import shutil
-import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from conftest import make_record
+from conftest import make_record, temp_store_root
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
@@ -94,7 +93,7 @@ def test_fuzzed_policy_interleavings_never_reach_retrievable_without_promotion(
     odd-indexed records ``evergreen`` so the decay-scope invariant has
     evergreen subjects in every walk.
     """
-    root = Path(tempfile.mkdtemp(prefix="evogine-lifecycle-prop-"))
+    root = temp_store_root("evogine-lifecycle-prop-")
     try:
         engine = Engine(root)
         promoted_now: set[str] = set()
@@ -211,7 +210,7 @@ def test_reinstated_promotion_is_retrievable_again_and_decay_composes(
     pass's own ``confidence_updated_at`` stamp, so re-running decay at the
     same instant is a no-op (the direction property never wobbles).
     """
-    root = Path(tempfile.mkdtemp(prefix="evogine-lifecycle-roundtrip-"))
+    root = temp_store_root("evogine-lifecycle-roundtrip-")
     try:
         engine = Engine(root)
         rid = RECORD_IDS[0]

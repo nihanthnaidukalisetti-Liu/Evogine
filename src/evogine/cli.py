@@ -118,7 +118,10 @@ from evogine.gates.telemetry import (
     RunsEvidenceSink,
     TelemetryError,
 )
+
+# --- V4 swarm: repository decomposer (appended in its own section to ease rebases) ---
 from evogine.swarm.clients import AnthropicClient, ModelClient, RetryingModelClient
+from evogine.swarm.decomposition import DecompositionError, decompose, render_summary_table
 
 DEFAULT_BENCH_REPEATS = 8
 """The offline bench's repeat count when neither a flag nor a protocol pins one."""
@@ -343,6 +346,25 @@ def main(argv: list[str] | None = None) -> int:
         help="config file to read (default: ./evogine.yaml); a missing config is a warning, not an error",
     )
 
+    # --- V4 swarm: repository decomposer (appended in its own section so a
+    # parallel task's parser work rebases without touching this block) ---
+    decompose_parser = subparsers.add_parser(
+        "decompose",
+        help=(
+            "repository decomposer: module graph + criticality scoring "
+            "(pure analysis; no store writes)"
+        ),
+    )
+    decompose_parser.add_argument(
+        "--repo", required=True, help="path to the Python repository to decompose"
+    )
+    decompose_parser.add_argument(
+        "--json",
+        dest="json_out",
+        default=None,
+        help="write the full DAG as JSON to this path, or - for stdout",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "run":
         return _run(args.root, repeats=args.repeats)
@@ -388,6 +410,8 @@ def main(argv: list[str] | None = None) -> int:
         return _init(args.root, config_path=args.config_path)
     if args.command == "doctor":
         return _doctor(config_path=args.config_path)
+    if args.command == "decompose":
+        return _decompose(args.repo, json_out=args.json_out)
     return 0  # unreachable: subcommands are required
 
 
@@ -1204,4 +1228,37 @@ def _doctor(*, config_path: str | None) -> int:
         print(f"doctor: not ready — {fails} failure(s), {warns} warning(s), {ok} ok")
         return 1
     print(f"doctor: ready ({ok} ok, {warns} warning(s))")
+    return 0
+
+
+# --- V4 swarm: repository decomposer (appended in its own section to ease rebases) ---
+
+
+def _decompose(repo: str, *, json_out: str | None) -> int:
+    """Decompose a Python repository: summary table, optional JSON DAG dump.
+
+    Pure analysis over the working tree — the store is never touched; the
+    only file this writes is the ``--json`` output the operator asked for
+    (``-`` prints the JSON to stdout instead).
+    """
+    repo_path = Path(repo)
+    if not repo_path.is_dir():
+        return _refuse(f"--repo path is not a directory: {repo}")
+    try:
+        dag = decompose(repo_path)
+    except DecompositionError as exc:
+        return _refuse(str(exc))
+    print(render_summary_table(dag))
+    if json_out is None:
+        return 0
+    payload = dag.model_dump_json(indent=2)
+    if json_out == "-":
+        print(payload)
+        return 0
+    out_path = Path(json_out)
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(payload + "\n", encoding="utf-8")
+    except OSError as exc:
+        return _refuse(f"cannot write --json output to {json_out}: {exc}")
     return 0

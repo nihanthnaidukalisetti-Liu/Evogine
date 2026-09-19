@@ -3,10 +3,12 @@
 Six read-only pages — overview, decisions, one decision's drill-down, the
 approvals queue, the audit timeline, and the proposal funnel — render the
 typed views from :mod:`evogine.console.views` and
-:mod:`evogine.console.funnel`. There is deliberately no write route and no
-auth stack in this PR: the console foundation is read-only (the write path
-through the boundary functions is a separate, reviewed change), and the
-server binds loopback only, so there is nothing exposed to authenticate.
+:mod:`evogine.console.funnel`. The write path
+(:mod:`evogine.console.write`) registers the two POST routes that decide
+one approval proposal each; every write goes through the approval boundary
+functions under the store lock, and there is deliberately no auth stack:
+the server binds loopback only (machine possession is the trust anchor),
+so there is nothing exposed to authenticate.
 
 Templates are server-rendered Jinja2 with autoescaping on — decision
 reasons, trajectories, and record content are store data and are never
@@ -28,12 +30,13 @@ from starlette.responses import Response
 from evogine.console import views
 from evogine.console.funnel import funnel_routes
 from evogine.console.launch import ConsoleError, validate_operator
+from evogine.console.write import register_write_routes
 
 _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 
 
 def create_app(root: Path | str, operator: str) -> FastAPI:
-    """Build the read-only console for one store root and operator identity.
+    """Build the console for one store root and operator identity.
 
     The factory is the only construction path: every page is served for
     exactly one root and one operator, both shown in the page header so the
@@ -120,5 +123,9 @@ def create_app(root: Path | str, operator: str) -> FastAPI:
         return render(request, "audit.html", {"rows": timeline, "empty": not timeline})
 
     app.include_router(funnel_routes(store_root, render))
+
+    # The write path is its own module so the read-only surface stays a
+    # separate, reviewable change; registration is the only seam.
+    register_write_routes(app, store_root, identity, refuse=refusal)
 
     return app

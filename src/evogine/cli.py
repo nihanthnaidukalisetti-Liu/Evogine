@@ -282,7 +282,7 @@ def main(argv: list[str] | None = None) -> int:
     console_parser.add_argument(
         "--operator",
         required=True,
-        help='operator identity shown on the console, e.g. "Nihanth <nihanth@example.eg>"',
+        help='operator identity recorded on console actions, e.g. "Nihanth nihanth@example.eg"',
     )
     console_parser.add_argument(
         "--host",

@@ -28,6 +28,10 @@
   .muted { color: #667085; }
   .empty { color: #667085; font-style: italic; padding: 0.75rem 0; }
   .error { color: #b42318; }
+  form.decide { display: flex; gap: 0.35rem; margin: 0.15rem 0; align-items: center; }
+  form.decide input[type="text"] { flex: 1; min-width: 10rem; padding: 0.2rem 0.4rem; font-size: 0.82rem; border: 1px solid #d0d5dd; }
+  form.decide button { padding: 0.2rem 0.6rem; font-size: 0.82rem; cursor: pointer; border: 1px solid #175cd3; background: #175cd3; color: #fff; border-radius: 4px; }
+  form.decide button.reject { border-color: #b42318; background: #fff; color: #b42318; }
   footer { color: #98a2b3; font-size: 0.78rem; padding: 0.75rem 1.25rem; }
   a { color: #175cd3; }
 </style>
@@ -48,6 +52,6 @@
 <main>
 {% block content %}{% endblock %}
 </main>
-<footer>read-only &middot; loopback only &middot; no auth stack (local operator console, V3 spec W1)</footer>
+<footer>loopback only &middot; no auth stack (local operator console, V3 spec W1)</footer>
 </body>
 </html>

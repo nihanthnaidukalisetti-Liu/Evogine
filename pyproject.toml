@@ -59,6 +59,9 @@ target-version = "py312"
 # design and run for real in the dedicated console CI job.
 "tests/test_console.py" = ["E402"]
 "tests/test_console_funnel.py" = ["E402"]
+# The write-path suite skips the same way (the optional [console] extra is
+# absent in core CI jobs), so its imports follow the skip call by design.
+"tests/test_console_write.py" = ["E402"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/evogine"]

@@ -1,6 +1,6 @@
 """The console launcher: validate everything, then bind loopback and serve.
 
-``evogine console --root <root> --operator "Name <email>"`` (wired in
+``evogine console --root <root> --operator "Nihanth nihanth@example.eg"`` (wired in
 :mod:`evogine.cli`) resolves here; the CLI's import of this module is lazy
 so the core install never loads FastAPI or uvicorn — they exist only behind
 the optional ``[console]`` extra.
@@ -55,7 +55,7 @@ def main(argv: list[str] | None = None) -> int:
     """The ``python -m evogine.console.server`` entry point."""
     parser = argparse.ArgumentParser(
         prog="evogine console",
-        description="Localhost operator console over one store's telemetry (read-only).",
+        description="Localhost operator console over one store's telemetry.",
     )
     parser.add_argument(
         "--root", required=True, help="engine store root to read (required; git-safety)"
@@ -63,7 +63,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--operator",
         required=True,
-        help='operator identity recorded on actions, e.g. "Nihanth <nihanth@example.eg>"',
+        help='operator identity recorded on decisions, e.g. "Nihanth nihanth@example.eg"',
     )
     parser.add_argument(
         "--host",

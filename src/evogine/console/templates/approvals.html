@@ -17,6 +17,15 @@
       {% if row.decided_by %}
       {{ row.decided_by }} <span class="muted">({{ row.decided_at or "—" }})</span>
       {% if row.decided_reason %}<br><code>{{ row.decided_reason }}</code>{% endif %}
+      {% elif row.state == "pending" %}
+      <form method="post" action="/approvals/{{ row.proposal_id }}/approve" class="decide">
+        <input type="text" name="reason" placeholder="note (optional)" aria-label="Approval note for {{ row.proposal_id }}">
+        <button type="submit">Approve</button>
+      </form>
+      <form method="post" action="/approvals/{{ row.proposal_id }}/reject" class="decide">
+        <input type="text" name="reason" required placeholder="reason (required)" aria-label="Rejection reason for {{ row.proposal_id }}">
+        <button type="submit" class="reject">Reject</button>
+      </form>
       {% else %}
       <span class="pending">awaiting an operator</span>
       {% endif %}
@@ -24,6 +33,6 @@
   </tr>
   {% endfor %}
 </table>
-<p class="muted">Approve or reject with the <code>evogine approvals</code> CLI — the console is read-only.</p>
+<p class="muted">Approve or reject one proposal at a time — each decision goes through the approval boundary under the store's review lock and is recorded with your operator identity.</p>
 {% endif %}
 {% endblock %}

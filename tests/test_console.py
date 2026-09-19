@@ -1,10 +1,11 @@
 """Console route, refusal, and launch tests against a fixture store.
 
-The console is a read-only transport over telemetry the gate and CLI
-already write, so these tests build a real store (propose, queue replay,
-review through the memory gate, approve through the approval log) and then
-exercise the pages through the FastAPI TestClient — fully offline. The
-launch tests assert the loopback-only contract and the startup refusals.
+The console is a transport over telemetry the gate and CLI already write,
+plus the write path through the approval boundary functions, so these tests
+build a real store (propose, queue replay, review through the memory gate,
+approve through the approval log) and then exercise the pages through the
+FastAPI TestClient — fully offline. The launch tests assert the
+loopback-only contract and the startup refusals.
 """
 
 from __future__ import annotations
@@ -48,7 +49,7 @@ if TYPE_CHECKING:
 
     from evogine.engine.records import LearningRecord
 
-OPERATOR = "Nihanth <nihanth@localhost>"
+OPERATOR = "nihanth"
 
 
 def binary_run(run_id: str, arm: str, outcomes: list[bool]) -> ReplayRun:
@@ -193,7 +194,7 @@ def test_overview_renders_counts_and_launch_context(
     response = client.get("/")
     assert response.status_code == 200
     # The operator identity is shown on every page — escaped, like all data.
-    assert "Nihanth &lt;nihanth@localhost&gt;" in response.text
+    assert "nihanth" in response.text
     assert str(console_store) in response.text  # the store root is shown
     assert "pending" in response.text
 
@@ -381,7 +382,10 @@ def test_approvals_queue_lists_pending_first_then_decided(
     assert "nihanth" in response.text  # decided_by is shown
     assert "convincing" in response.text  # decided_reason is shown
     assert "cleared:" in response.text  # the proposal's machine-checked trail
-    assert "read-only" in response.text  # the page points writers at the CLI
+    assert "read-only" not in response.text  # the console now offers the decision itself
+    # Pending rows carry the decision forms; decided rows do not.
+    assert "/approvals/appr-prop-5/approve" in response.text
+    assert "/approvals/appr-prop-1/approve" not in response.text
     # The drill-down links by record id — the key the decision log uses.
     assert "/decisions/prop-1" in response.text
     assert "/decisions/prop-5" in response.text

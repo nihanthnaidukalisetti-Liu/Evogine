@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+{% block title %}Swarm board · Evogine Console{% endblock %}
+{% block content %}
+<h2>Swarm board</h2>
+<p class="muted">Orchestrator runs read from each run directory's typed event feed (<code>events.jsonl</code>) — the same file the orchestrator writes, through the orchestrator's own readers. Read-only over existing data; a refused run is a state, not an error to hide.</p>
+
+{% if not view.runs_present %}
+<p class="empty">No swarm runs directory at <code>{{ view.runs_root }}</code> — nothing has run yet, so there is no board to show.</p>
+{% elif not view.runs %}
+<p class="empty">No runs under <code>{{ view.runs_root }}</code> yet — the board is empty, not hidden.</p>
+{% else %}
+<table>
+  <tr><th>Run</th><th>State</th><th>Feed</th><th>Workers</th><th>Items</th><th>Checkpoints</th><th>Spend vs ceiling</th><th>Refusal</th></tr>
+  {% for row in view.runs %}
+  <tr>
+    <td><code>{{ row.run_id }}</code></td>
+    <td>
+      {% if row.refusal %}<span class="pill fail">refused</span>
+      {% elif row.complete %}<span class="pill pass">complete</span>
+      {% else %}<span class="pill pending">in progress</span>{% endif %}
+    </td>
+    <td>
+      {% if row.feed_state == "ok" %}
+        {{ row.events }} event(s)
+        <div class="muted">started {{ row.started_at or "—" }} · last {{ row.last_event_at or "—" }}</div>
+      {% elif row.feed_state == "corrupt" %}
+        <span class="pill fail">corrupt feed</span>
+        <div class="muted">{{ row.feed_note }}</div>
+      {% else %}
+        <span class="empty">no events yet</span>
+        <div class="muted">{{ row.feed_note }}</div>
+      {% endif %}
+    </td>
+    <td>
+      {% for w in row.workers %}
+      <div><code>w{{ w.worker_id }}</code> {{ w.last_status or "no status" }} <span class="muted">· {{ w.calls }} call(s), ${{ w.spent_usd }}</span></div>
+      {% endfor %}
+      {% if not row.workers %}<span class="empty">no workers spawned</span>{% endif %}
+    </td>
+    <td>
+      {% for status, count in row.item_counts | dictsort %}
+      <div>{{ status }}: {{ count }}</div>
+      {% endfor %}
+      {% if row.items_total is not none %}
+      <div class="muted">total {{ row.items_completed }}/{{ row.items_total }}{% if row.resumed_items %} · resumed {{ row.resumed_items }}{% endif %}</div>
+      {% elif not row.item_counts %}
+      <span class="empty">no items yet</span>
+      {% endif %}
+    </td>
+    <td>{{ row.checkpoint_markers }} item marker(s){% if row.complete %} · run frozen (complete.marker){% endif %}</td>
+    <td>
+      {% if row.spent_usd is not none %}
+      <div class="bar"><div class="bar-fill" style="width: {{ row.spend_percent_clamped }}%"></div></div>
+      ${{ row.spent_usd }} of ${{ row.ceiling_usd }} <span class="muted">({{ row.spend_percent_display }}, display-rounded)</span>
+      {% else %}
+      <span class="empty">no metered calls</span>
+      {% endif %}
+    </td>
+    <td>
+      {% if row.refusal %}
+      <div><span class="pill fail">{{ row.refusal.reason }}</span></div>
+      <div class="muted">{{ row.refusal.detail }}</div>
+      <div class="muted">spent ${{ row.refusal.spent_usd }}{% if row.refusal.projected_usd is not none %} · projected ${{ row.refusal.projected_usd }}{% endif %} of ${{ row.refusal.ceiling_usd }} ceiling</div>
+      {% else %}—{% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+{% endblock %}

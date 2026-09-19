@@ -1,9 +1,10 @@
 """The FastAPI application factory: routes are a thin transport over views.
 
-Six read-only pages — overview, decisions, one decision's drill-down, the
-approvals queue, the audit timeline, and the proposal funnel — render the
-typed views from :mod:`evogine.console.views` and
-:mod:`evogine.console.funnel`. The write path
+Eight read-only pages — overview, decisions, one decision's drill-down, the
+approvals queue, the audit timeline, the proposal funnel, the swarm board,
+and the learning loop — render the typed views from
+:mod:`evogine.console.views`, :mod:`evogine.console.funnel`, and
+:mod:`evogine.console.swarm`. The write path
 (:mod:`evogine.console.write`) registers the two POST routes that decide
 one approval proposal each; every write goes through the approval boundary
 functions under the store lock, and there is deliberately no auth stack:
@@ -30,20 +31,29 @@ from starlette.responses import Response
 from evogine.console import views
 from evogine.console.funnel import funnel_routes
 from evogine.console.launch import ConsoleError, validate_operator
+from evogine.console.swarm import resolve_swarm_runs_root, swarm_routes
 from evogine.console.write import register_write_routes
 
 _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 
 
-def create_app(root: Path | str, operator: str) -> FastAPI:
+def create_app(
+    root: Path | str,
+    operator: str,
+    swarm_runs_root: Path | str | None = None,
+) -> FastAPI:
     """Build the console for one store root and operator identity.
 
     The factory is the only construction path: every page is served for
     exactly one root and one operator, both shown in the page header so the
-    operator always knows which store they are looking at.
+    operator always knows which store they are looking at. The swarm board
+    reads run directories under ``swarm_runs_root`` when given, else the
+    derived default under the store root (the config's ``swarm.runs_dir``
+    location).
     """
     identity = validate_operator(operator)
     store_root = Path(root)
+    runs_root = resolve_swarm_runs_root(store_root, swarm_runs_root)
     app = FastAPI(title="Evogine Console", docs_url=None, redoc_url=None, openapi_url=None)
     templates = Jinja2Templates(
         env=jinja2.Environment(
@@ -123,6 +133,7 @@ def create_app(root: Path | str, operator: str) -> FastAPI:
         return render(request, "audit.html", {"rows": timeline, "empty": not timeline})
 
     app.include_router(funnel_routes(store_root, render))
+    app.include_router(swarm_routes(store_root, runs_root, render))
 
     # The write path is its own module so the read-only surface stays a
     # separate, reviewable change; registration is the only seam.

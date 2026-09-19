@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}Learning loop · Evogine Console{% endblock %}
+{% block content %}
+<h2>Learning loop</h2>
+<p class="muted">Proposals → gates → approvals → promotion, over the store's own funnel engine and logs — the funnel numbers are the same report <code>evogine decisions funnel</code> prints, never a second accounting.</p>
+
+<h3>Funnel stages</h3>
+<table>
+  <tr><th>Stage</th><th>Count</th><th>Meaning</th></tr>
+  {% for row in view.funnel.stage_rows %}
+  <tr>
+    <td>{{ row.stage }}</td>
+    <td><strong>{{ row.count }}</strong></td>
+    <td class="muted">{{ row.meaning }}</td>
+  </tr>
+  {% endfor %}
+</table>
+
+<h3>Store health</h3>
+<table>
+  <tr><th>Signal</th><th>Value</th><th>Meaning</th></tr>
+  {% for row in view.health %}
+  <tr>
+    <td>{{ row.label }}</td>
+    <td><strong>{{ row.value }}</strong></td>
+    <td class="muted">{{ row.meaning }}</td>
+  </tr>
+  {% endfor %}
+</table>
+
+<h3>Promotion telemetry</h3>
+{% if view.promotions %}
+<table>
+  <tr><th>Decided</th><th>Proposal</th><th>Stage</th><th>Outcome</th><th>Pass</th><th>Review latency</th><th>Reason</th></tr>
+  {% for row in view.promotions %}
+  <tr>
+    <td class="muted">{{ row.decided_at }}</td>
+    <td><code>{{ row.proposal_id }}</code></td>
+    <td><code>{{ row.stage }}</code></td>
+    <td>{% if row.promoted %}<span class="pill pass">promoted</span>{% else %}<span class="pill fail">not promoted</span>{% endif %}</td>
+    <td>{% if row.pass_id %}<code>{{ row.pass_id }}</code>{% else %}<span class="muted">—</span>{% endif %}</td>
+    <td>{% if row.review_latency_seconds is not none %}{{ row.review_latency_seconds }}s{% else %}<span class="muted">—</span>{% endif %}</td>
+    <td class="muted">{{ row.reason }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<p class="empty">No promotion decisions recorded — nothing has been reviewed yet, so there is no promotion history to show.</p>
+{% endif %}
+{% endblock %}

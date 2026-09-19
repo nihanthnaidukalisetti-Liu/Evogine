@@ -17,6 +17,7 @@ store commits can never sweep up unrelated files.
 from __future__ import annotations
 
 import fcntl
+import logging
 import os
 import re
 import subprocess
@@ -38,6 +39,15 @@ from evogine.engine.records import (
 )
 from evogine.engine.retrieval import DEFAULT_FLOOR
 from evogine.engine.retrieval import retrieve as hybrid_retrieve
+from evogine.ops.logging_setup import log_event
+from evogine.ops.metrics import NO_STATUS, STORE_TRANSITIONS_TOTAL, metrics
+from evogine.ops.migrations import (
+    CURRENT_SCHEMA_VERSION,
+    SchemaError,
+    SchemaState,
+    ensure_openable,
+    write_schema,
+)
 
 # Ids become filenames under ``records/``: lock them to filesystem- and
 # git-safe characters so a malicious proposal can never traverse paths
@@ -50,6 +60,10 @@ _ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 # a qualified id ``<store-name>:<record-id>`` splits unambiguously on the
 # first colon (docs/cross-project-memory.md, invariant 3.4).
 _STORE_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+
+#: Library-side logger: the engine only emits; formatting/level/sink belong
+#: to the config module's settings via the ops logging entry point.
+logger = logging.getLogger(__name__)
 
 #: Identity of a standalone store that was never given a name. Federation
 #: registries always pass an explicit name; the default keeps the
@@ -224,8 +238,23 @@ class Engine:
         self.records_dir = self.root / "records"
         self.audit_path = self.root / "audit.jsonl"
         self.records_dir.mkdir(parents=True, exist_ok=True)
-        if not (self.root / ".git").exists():
+        fresh_store = not (self.root / ".git").exists()
+        if fresh_store:
             _git(self.root, "init", "-q")
+        # Schema gate (V4 ops): a store written by NEWER code is refused
+        # here — reading a schema this build does not understand is how
+        # silent corruption happens; refusing is the visible alternative.
+        # Legacy stores (predating the stamp) read as version 1 and keep
+        # working unchanged; only fresh stores write a stamp, born current.
+        try:
+            ensure_openable(self.root)
+        except SchemaError as exc:
+            raise StoreError(str(exc)) from exc
+        if fresh_store:
+            write_schema(
+                self.root,
+                SchemaState(version=CURRENT_SCHEMA_VERSION, updated_at=_now()),
+            )
         # The review lock file exists from store birth so the first lifecycle
         # commit versions it — a lock file created lazily could be left
         # untracked by a refused boundary action (no commit follows a refusal).
@@ -793,6 +822,27 @@ class Engine:
         stamped = event.model_copy(update={"seq": seq + 1, "ts": _now()})
         with self.audit_path.open("a", encoding="utf-8") as fh:
             fh.write(stamped.model_dump_json() + "\n")
+        # The transition counter rides the audit choke point: every
+        # lifecycle event is counted exactly once, with the status
+        # transition it made. The same event goes to the structured log.
+        metrics().increment(
+            STORE_TRANSITIONS_TOTAL,
+            {
+                "event": event.event,
+                "from_status": event.from_status or NO_STATUS,
+                "to_status": event.to_status,
+            },
+        )
+        log_event(
+            logger,
+            logging.INFO,
+            "store.transition",
+            f"{event.event} {event.record_id}: {event.from_status or NO_STATUS} -> {event.to_status}",
+            event=event.event,
+            record_id=event.record_id,
+            from_status=event.from_status or NO_STATUS,
+            to_status=event.to_status,
+        )
 
     def _all_records(self) -> list[LearningRecord]:
         return [

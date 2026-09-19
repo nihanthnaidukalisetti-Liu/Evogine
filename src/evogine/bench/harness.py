@@ -224,7 +224,7 @@ class BenchHarness:
                     "pass protocol or plan, not both"
                 )
             check = _validate_protocol_pre_run(protocol, pool, case_ids, repeats)
-            _refuse_contaminated_holdout(self._retriever, check, pool)
+            refuse_contaminated_holdout(self._retriever, check, pool)
             cases = list(check.cases)
             effective_repeats = protocol.repeats
         else:
@@ -317,7 +317,7 @@ def _validate_protocol_pre_run(
     return check
 
 
-def _refuse_contaminated_holdout(
+def refuse_contaminated_holdout(
     retriever: Retriever, check: ProtocolCheck, pool: Sequence[BenchCase]
 ) -> None:
     """V2-7 recall gate: a contaminated holdout is not fresh — refuse pre-spend.
@@ -480,4 +480,5 @@ __all__ = [
     "CaseRunner",
     "Retriever",
     "RunSummary",
+    "refuse_contaminated_holdout",
 ]

@@ -17,6 +17,8 @@ import pytest
 from evogine.bench.cases.base import BenchCase
 from evogine.bench.cases.corpus import default_corpus
 from evogine.bench.gate_replay import replay_run_ids
+from evogine.bench.harness import CaseOutcome, RunArtifacts
+from evogine.bench.rundirs import open_run
 from evogine.cli import main
 from evogine.engine.records import LearningRecord, RecordBody
 from evogine.engine.store import Engine
@@ -138,3 +140,66 @@ def test_bench_cli_refuses_repeats_below_the_replay_floor(
 
     assert main(["bench", "--root", str(root), "--repeats", "2"]) == 1
     assert "below the 4-repeat floor" in capsys.readouterr().err
+
+
+def test_run_cli_persists_per_replay_outcome_evidence(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`evogine run` leaves per-replay run dirs: outcomes, descriptor, marker."""
+    root = tmp_path / "store"
+    _propose_candidate(root, _retry_learning_draft())
+
+    assert main(["run", "--root", str(root)]) == 0
+    capsys.readouterr()
+
+    replay_dirs = sorted((root / "runs" / "replay").iterdir())
+    assert len(replay_dirs) == 2  # one baseline + one warm replay for the candidate
+    for replay_dir in replay_dirs:
+        assert (replay_dir / "complete.marker").exists()
+        artifacts = replay_dir / "artifacts"
+        # 10 cases x 2 arms x 8 repeats per harness run
+        assert len(list(artifacts.glob("outcome-*.json"))) == 160
+        descriptor = json.loads((artifacts / "replay-run.json").read_text(encoding="utf-8"))
+        assert descriptor["replay_run_id"].startswith("replay-")
+        assert descriptor["gate_arm"] in ("baseline", "warm")
+
+
+def test_bench_cli_persists_a_resumable_run_dir(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`evogine bench` persists a complete run dir; completed runs are immutable."""
+    root = tmp_path / "store"
+
+    assert main(["bench", "--root", str(root), "--format", "json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    run_dir = Path(payload["run_dir"])
+    assert (run_dir / "complete.marker").exists()
+    assert len(list((run_dir / "artifacts").glob("outcome-*.json"))) == 160
+
+    assert main(["bench", "--root", str(root), "--run-id", payload["run_id"]]) == 1
+    assert "immutable" in capsys.readouterr().err
+
+
+def test_bench_cli_resume_reuses_persisted_outcomes(tmp_path: Path) -> None:
+    """An interrupted bench run resumes: the persisted outcome is reused, not clobbered."""
+    root = tmp_path / "store"
+    run = open_run(root / "runs" / "bench", run_id="bench-resume")
+    RunArtifacts(run).save(
+        CaseOutcome(
+            case_id="retry-jitter-budget",
+            arm="cold",
+            repeat=0,
+            passed=False,
+            output="pre-existing",
+            knowledge_ids=[],
+        )
+    )
+
+    assert main(["bench", "--root", str(root), "--run-id", "bench-resume"]) == 0
+    assert (run.directory / "complete.marker").exists()
+    outcome = json.loads(
+        (run.directory / "artifacts" / "outcome-retry-jitter-budget-cold-0000.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert outcome["output"] == "pre-existing"

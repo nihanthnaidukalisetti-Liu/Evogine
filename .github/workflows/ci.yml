@@ -5,16 +5,17 @@ name: CI
 # evogine.engine, gitleaks secret scanning, a Docker-gated job that runs
 # the same suite where the daemon exists (ubuntu-latest runners have Docker)
 # so the sandbox's isolation and seccomp guarantees are enforced for real,
-# not just locally, and a console job that runs the optional [console]
-# extra's route suite with its own package coverage floor. The core jobs
-# install only the core extras, so the core install gains no new runtime
-# dependencies; optional-component code skips cleanly there and is tested
-# in its own job. No secrets required by the suite: it makes no live API
-# calls; nothing here needs a token. The gitleaks job runs the pinned
-# release binary directly — the action variant calls the GitHub API to
-# report findings, which fails with "Resource not accessible by" when the
-# default token lacks those scopes; a raw binary scan needs no permissions
-# and still scans the full history.
+# not just locally, a console job that runs the optional [console]
+# extra's route suite with its own package coverage floor, and a sync job
+# that runs the optional [server] extra's daemon suite the same way. The
+# core jobs install only the core extras, so the core install gains no new
+# runtime dependencies; optional-component code skips cleanly there and is
+# tested in its own job. No secrets required by the suite: it makes no
+# live API calls; nothing here needs a token. The gitleaks job runs the
+# pinned release binary directly — the action variant calls the GitHub API
+# to report findings, which fails with "Resource not accessible by" when
+# the default token lacks those scopes; a raw binary scan needs no
+# permissions and still scans the full history.
 on:
   push:
     branches: [main]
@@ -51,9 +52,10 @@ jobs:
 
       # The console extra is installed here so strict mypy can resolve and
       # type the optional evogine.console package; type-time dependency,
-      # not a new runtime dependency of the core install.
-      - name: Install package with dev and console dependencies
-        run: pip install -e ".[dev,console]"
+      # not a new runtime dependency of the core install. The server extra
+      # covers the sync daemon the same way.
+      - name: Install package with dev, console, and server dependencies
+        run: pip install -e ".[dev,console,server]"
 
       # Strictness lives in [tool.mypy] (pyproject), so this invocation is
       # exactly what a local `mypy src/evogine` runs.
@@ -156,3 +158,34 @@ jobs:
         run: >
           pytest tests/test_console.py tests/test_console_funnel.py tests/test_console_write.py -q
           --cov=evogine.console --cov-report=term-missing --cov-fail-under=90
+
+  # The sync daemon is optional transport behind the [server] extra: the core
+  # jobs above never install it and the sync tests skip there. This job runs
+  # the daemon's offline suite where the extra exists — binding policy and
+  # visible refusals, a real uvicorn + git clone/push/pull round trip over
+  # loopback, advisory-lock serialization, the append-only audit merge
+  # driver, and the read/query API — with the sync package's own coverage
+  # floor. Offline: loopback only, no external network.
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install package with dev and server dependencies
+        run: pip install -e ".[dev,server]"
+
+      # Measured at 97% at introduction; the 95% floor is the sync package's
+      # own requirement, matching the repo's floor-slightly-below-measured
+      # convention so meaningful erosion is blocked without flaking.
+      - name: Sync daemon tests with package coverage floor
+        run: >
+          pytest tests/test_sync_settings.py tests/test_sync_queries.py
+          tests/test_sync_binding.py tests/test_sync_server.py
+          tests/test_sync_transport.py tests/test_sync_merge.py -q
+          --cov=evogine.sync --cov-report=term-missing --cov-fail-under=95

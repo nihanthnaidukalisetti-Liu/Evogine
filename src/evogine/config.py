@@ -166,6 +166,25 @@ class LoggingSettings(BaseModel):
     format: Literal["text", "json"] = "text"
 
 
+# --- V4 swarm: run-directory settings (appended in its own section to ease
+# --- rebases; the sync-client PR edits this file additively too) ---
+class SwarmSettings(BaseModel):
+    """Swarm orchestration settings (V4): where swarm run directories live.
+
+    Relative paths resolve against the profile's learning store root — the
+    same anchor every other runs directory uses (``<root>/runs/bench``,
+    ``runs/shadow``, ``runs/replay``) — so the writer (``swarm run``) and
+    the console's read-only swarm board agree on one location by
+    construction.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    runs_dir: Path = Field(default=Path("runs/swarm"))
+    """Run-directory root holding one directory (with its ``events.jsonl``
+    feed) per orchestrated run."""
+
+
 class ProfileSettings(BaseModel):
     """One named profile: every knob, with the optional sections defaulted.
 
@@ -181,6 +200,7 @@ class ProfileSettings(BaseModel):
     workers: WorkerPoolSettings = Field(default_factory=WorkerPoolSettings)
     sync: SyncSettings = Field(default_factory=SyncSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
+    swarm: SwarmSettings = Field(default_factory=SwarmSettings)
 
 
 class EvogineConfig(BaseModel):
@@ -271,6 +291,12 @@ profiles:
       #   - name: laptop
       #     url: http://127.0.0.1:8766
       #     store: alpha
+    swarm:
+      # V4 swarm runs: the directory holding one run directory (with its
+      # events.jsonl feed) per orchestrated run, resolved against the
+      # learning store root. The console's read-only swarm board reads the
+      # same location.
+      runs_dir: runs/swarm
     logging:
       level: info
       # 'json' renders one JSON object per line for log shippers and the

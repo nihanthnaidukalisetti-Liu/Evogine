@@ -149,8 +149,10 @@ jobs:
         run: pip install -e ".[dev,console]"
 
       # Measured at 96% at introduction; the 90% floor is the console
-      # package's own requirement from the V3 verification matrix.
+      # package's own requirement from the V3 verification matrix. The
+      # console suites run together so the package floor covers the read
+      # pages and the write path in one measurement.
       - name: Console route tests with package coverage floor
         run: >
-          pytest tests/test_console.py tests/test_console_funnel.py -q
+          pytest tests/test_console.py tests/test_console_funnel.py tests/test_console_write.py -q
           --cov=evogine.console --cov-report=term-missing --cov-fail-under=90

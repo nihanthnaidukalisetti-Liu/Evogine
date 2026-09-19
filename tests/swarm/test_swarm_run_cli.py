@@ -21,11 +21,12 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
+import pytest
 from conftest import temp_store_root
 from hypothesis import given, settings
 from hypothesis import strategies as st
@@ -56,6 +57,19 @@ CALL_COST = Decimal("0.0015")
 TIGHT_CEILING = "0.004"
 PRICES = ("--input-price-per-mtok-usd", "1.00", "--output-price-per-mtok-usd", "1.00")
 KNOBS = ("--max-call-input-tokens", "100000")
+
+
+@pytest.fixture(autouse=True)
+def _reclaim_container_tmpfs(tmp_path: Path) -> Iterator[None]:
+    """Reclaim this test's tmp tree when the test ends.
+
+    The docker-gated suite runs on a 64MB /tmp tmpfs and pytest retains every
+    per-test tree until session end. These store-heavy CLI tests collect
+    before the root suite; their retained trees pushed the late-alphabet
+    tests over the cap (Errno 28 in the gate's candidate run).
+    """
+    yield
+    shutil.rmtree(tmp_path, ignore_errors=True)
 
 
 def _write_config(

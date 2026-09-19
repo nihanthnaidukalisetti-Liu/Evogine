@@ -72,6 +72,10 @@ jobs:
       # erosion without flaking on Docker-skipped probes (this job never
       # installs docker-py, so those probes skip cleanly).
       - name: Pytest with coverage floor on gates and engine
+        env:
+          # Property suites ride the ci profile (200 examples vs 30 locally);
+          # the dev default stays for local runs.
+          HYPOTHESIS_PROFILE: ci
         run: >
           pytest -q --cov=evogine.gates --cov=evogine.engine
           --cov-report=term-missing --cov-fail-under=96

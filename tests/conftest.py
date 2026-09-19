@@ -4,9 +4,14 @@ The suite is offline by contract — no live-model calls anywhere; these
 factories are pure pydantic construction.
 """
 
+import os
+import subprocess
+import tempfile
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
+from hypothesis import settings
 
 from evogine.engine.records import (
     LearningRecord,
@@ -14,6 +19,36 @@ from evogine.engine.records import (
     RecordCounterfactual,
     RecordProvenance,
 )
+
+# Hypothesis profiles: the ``dev`` default keeps local runs fast; CI exports
+# ``HYPOTHESIS_PROFILE=ci`` (see .github/workflows/ci.yml) to raise the
+# example budget. Tests that pay for real processes per example (git commits,
+# fresh interpreters) pin their own lower max_examples explicitly — the
+# profile raises the in-memory suites, not the process-heavy ones.
+settings.register_profile("dev", max_examples=30, deadline=None)
+settings.register_profile("ci", max_examples=200, deadline=None)
+settings.load_profile(os.getenv("HYPOTHESIS_PROFILE", "dev"))
+
+
+def temp_store_root(prefix: str) -> Path:
+    """Create a temp dir holding an initialized repo for a test store.
+
+    ``git commit`` can spawn a detached background ``git gc``
+    (``gc.autoDetach`` defaults to true) that keeps mutating ``.git/objects``
+    after the commit returns — racing ``shutil.rmtree`` cleanup with
+    ``OSError [Errno 39] Directory not empty`` in slower CI environments.
+    Repo-local config wins over the ambient default, so the helper inits the
+    repo and disables auto-gc there (production behavior untouched; the
+    Engine skips its own init when ``.git`` already exists).
+    """
+    root = Path(tempfile.mkdtemp(prefix=prefix))
+    subprocess.run(
+        ["git", "init", "-q"], cwd=root, check=True, capture_output=True, text=True
+    )
+    config = root / ".git" / "config"
+    with config.open("a", encoding="utf-8") as fh:
+        fh.write("[gc]\n\tauto = 0\n\tautoDetach = false\n")
+    return root
 
 
 def make_record(record_id: str, topic: str = "429 backoff") -> LearningRecord:

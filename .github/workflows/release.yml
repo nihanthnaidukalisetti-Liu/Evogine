@@ -1,0 +1,52 @@
+name: Release
+
+# Release packaging for version tags: build the sdist and wheel, smoke-test
+# the wheel in a fresh venv (evogine --help must run), and attach both
+# artifacts to the tag's GitHub Release.
+#
+# PyPI publishing is intentionally absent: no PyPI credentials exist for this
+# repository and authentication is out of scope for this milestone (see the
+# Security section of CHANGELOG.md). Only the default GITHUB_TOKEN is used,
+# with the minimal contents:write scope needed to create the release and
+# upload assets.
+#
+# workflow_dispatch builds the same artifacts without a tag (for example, to
+# verify packaging before cutting a release); the release-attach step is
+# skipped in that mode.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+
+      - name: Smoke test the wheel in a fresh venv
+        run: |
+          python -m venv /tmp/evogine-release-smoke
+          /tmp/evogine-release-smoke/bin/pip install dist/*.whl
+          /tmp/evogine-release-smoke/bin/evogine --help
+
+      - name: Attach artifacts to the GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

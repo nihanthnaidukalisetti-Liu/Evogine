@@ -60,6 +60,18 @@ its own trail, the landing recorded in the audit trail referencing the
 source by qualified id only. Both commands inject store paths through the
 federation registry (``--store`` names the scope, ``--root`` supplies the
 path); malformed or conflicting bundles are refused all-or-nothing.
+
+``sync status|push|pull`` (V4) is the client half of the git-native sync
+daemon: the config's sync-endpoints section becomes live — a named remote
+is a daemon URL plus the hosted store it serves. ``status`` queries every
+configured remote and rolls spend into one merged view with per-machine
+attribution (exact ``Decimal`` accounting); ``push`` publishes local store
+commits over the daemon transport (loopback-only, non-fast-forward
+refused); ``pull`` fetches and merges using the documented low-conflict
+merge surface under the engine's per-store advisory lock. Every command
+fails closed: an unreachable, misconfigured, or policy-refusing remote is
+rendered as the refusal it is — never a silent skip, never a fail-open
+write.
 """
 
 from __future__ import annotations
@@ -71,6 +83,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from decimal import Decimal
 from enum import Enum
 from pathlib import Path
 from urllib.error import HTTPError
@@ -148,6 +161,20 @@ from evogine.ops.compaction import CompactionError, compact_store
 # --- V4 swarm: repository decomposer (appended in its own section to ease rebases) ---
 from evogine.swarm.clients import AnthropicClient, ModelClient, RetryingModelClient
 from evogine.swarm.decomposition import DecompositionError, decompose, render_summary_table
+
+# --- V4 sync: client half of the daemon (appended in its own section to ease rebases) ---
+from evogine.sync.client import (
+    MergedSpend,
+    PullResult,
+    PushResult,
+    RemoteStatus,
+    SyncClientError,
+    fleet_status,
+    merge_spend,
+    pull_store,
+    push_store,
+    resolve_remote,
+)
 
 DEFAULT_BENCH_REPEATS = 8
 """The offline bench's repeat count when neither a flag nor a protocol pins one."""
@@ -490,6 +517,60 @@ def main(argv: list[str] | None = None) -> int:
         help="directory for the synthetic store (default: a fresh temp dir)",
     )
 
+    # --- V4 sync client: cross-machine push/pull and spend roll-up ----------
+    # Appended as its own section so parallel CLI registrations merge cleanly.
+    # This is where the config's sync-endpoints section becomes live: a named
+    # remote is a daemon URL plus the hosted store it serves, and every
+    # command fails closed — an unreachable, misconfigured, or
+    # policy-refusing remote renders as the refusal it is, never a silent skip.
+    sync_parser = subparsers.add_parser(
+        "sync",
+        help="cross-machine sync over configured sync endpoints (status, push, pull)",
+    )
+    sync_subparsers = sync_parser.add_subparsers(dest="sync_command", required=True)
+    sync_status_parser = sync_subparsers.add_parser(
+        "status",
+        help=(
+            "query every configured remote's store and roll its spend into one "
+            "merged, per-machine-attributed view"
+        ),
+    )
+    sync_status_parser.add_argument(
+        "--remote",
+        default=None,
+        help="limit the status to one configured remote (default: all of them)",
+    )
+    sync_status_parser.add_argument(
+        "--config",
+        dest="config_path",
+        default=None,
+        help="config file to read (default: ./evogine.yaml)",
+    )
+    for sync_verb, sync_verb_help in (
+        ("push", "publish local store commits to a configured remote"),
+        ("pull", "fetch and merge a remote's hosted store into the local store"),
+    ):
+        sync_transfer_parser = sync_subparsers.add_parser(sync_verb, help=sync_verb_help)
+        sync_transfer_parser.add_argument(
+            "--remote",
+            default=None,
+            help=(
+                "configured remote to operate on (default: the only endpoint; "
+                "required when several are configured)"
+            ),
+        )
+        sync_transfer_parser.add_argument(
+            "--root",
+            default=None,
+            help="local store root (default: the profile's learning_root)",
+        )
+        sync_transfer_parser.add_argument(
+            "--config",
+            dest="config_path",
+            default=None,
+            help="config file to read (default: ./evogine.yaml)",
+        )
+
     args = parser.parse_args(argv)
     if args.command == "run":
         return _run(args.root, repeats=args.repeats)
@@ -555,6 +636,12 @@ def main(argv: list[str] | None = None) -> int:
             seed=args.seed,
             repeats=args.repeats,
             store_dir=args.store_dir,
+        )
+    if args.command == "sync" and args.sync_command == "status":
+        return _sync_status(args.remote, config_path=args.config_path)
+    if args.command == "sync" and args.sync_command in ("push", "pull"):
+        return _sync_transfer(
+            args.sync_command, args.remote, args.root, config_path=args.config_path
         )
     return 0  # unreachable: subcommands are required
 
@@ -1204,16 +1291,22 @@ def _check_disk(root: Path) -> CheckResult:
 
 
 def _check_sync_endpoint(endpoint: SyncEndpoint) -> CheckResult:
-    """Probe one configured sync endpoint; unreachable fails with the fix."""
+    """Probe one configured sync endpoint; unreachable fails with the fix.
+
+    The probe targets the daemon's ``/health`` route — the documented
+    liveness surface — so a correctly configured base URL cannot fail just
+    because the origin itself answers 404.
+    """
     url = str(endpoint.url)
+    probe_url = url.rstrip("/") + "/health"
     try:
-        with urlopen(url, timeout=_SYNC_PROBE_TIMEOUT_SECONDS) as response:
+        with urlopen(probe_url, timeout=_SYNC_PROBE_TIMEOUT_SECONDS) as response:
             status = response.status
     except HTTPError as exc:
         return CheckResult(
             check="sync",
             state=CheckState.FAIL,
-            detail=f"endpoint {endpoint.name!r} answered HTTP {exc.code} at {url}",
+            detail=f"endpoint {endpoint.name!r} answered HTTP {exc.code} at {probe_url}",
             fix=(
                 "the daemon is answering but this path is wrong — correct the "
                 "endpoint URL in the config"
@@ -1223,13 +1316,27 @@ def _check_sync_endpoint(endpoint: SyncEndpoint) -> CheckResult:
         return CheckResult(
             check="sync",
             state=CheckState.FAIL,
-            detail=f"endpoint {endpoint.name!r} unreachable at {url}: {exc}",
+            detail=f"endpoint {endpoint.name!r} unreachable at {probe_url}: {exc}",
             fix="start the sync daemon, or correct the endpoint URL in the config",
+        )
+    if endpoint.store is None or not endpoint.store.strip():
+        return CheckResult(
+            check="sync",
+            state=CheckState.WARN,
+            detail=(
+                f"endpoint {endpoint.name!r} answered (HTTP {status}) at {probe_url} but "
+                "declares no store — 'evogine sync' commands refuse an endpoint "
+                "without one"
+            ),
+            fix="add 'store: <hosted-store-name>' under the endpoint in the config",
         )
     return CheckResult(
         check="sync",
         state=CheckState.OK,
-        detail=f"endpoint {endpoint.name!r} answered (HTTP {status}) at {url}",
+        detail=(
+            f"endpoint {endpoint.name!r} answered (HTTP {status}) at {probe_url} "
+            f"(store '{endpoint.store}')"
+        ),
     )
 
 
@@ -1521,4 +1628,167 @@ def _store_benchmark(records: int, *, seed: int, repeats: int, store_dir: str | 
         print(f"error: {exc}", file=sys.stderr)
         return 1
     print(benchmark.render())
+    return 0
+
+
+# --- V4 sync: client handlers (status roll-up, guarded push/pull) ----------
+
+
+def _sync_status(remote_name: str | None, *, config_path: str | None) -> int:
+    """Query the configured remotes and render one merged, attributed view.
+
+    Fail-closed visibility: a remote that cannot be resolved or reached is
+    rendered as the refusal it is — never skipped — and the merged view says
+    how many machines reported. Exits non-zero when any remote refused, so
+    an automation that greps exit codes notices a fleet that is not green.
+    """
+    cfg_path = Path(config_path) if config_path is not None else default_config_path()
+    try:
+        endpoints = list(load_config(cfg_path).profile().sync.endpoints)
+    except ConfigError as exc:
+        return _refuse(str(exc))
+    if remote_name is not None:
+        endpoints = [endpoint for endpoint in endpoints if endpoint.name == remote_name]
+        if not endpoints:
+            return _refuse(f"unknown sync remote {remote_name!r}")
+    if not endpoints:
+        return _refuse(
+            "no sync endpoints configured — add one under "
+            "profiles.<name>.sync.endpoints in the config"
+        )
+    statuses = fleet_status(endpoints)
+    reporting = [status.spend for status in statuses if status.ok and status.spend is not None]
+    merged = merge_spend(reporting)
+    print(_render_sync_status(statuses, merged))
+    if any(not status.ok for status in statuses):
+        return 1
+    return 0
+
+
+def _spend_line(
+    label: str,
+    recorded_runs: int,
+    actual_cost_usd: Decimal | None,
+    overage_usd: Decimal | None,
+    within_ceiling: bool | None,
+) -> str:
+    """One spend row; absence of spend is stated, never rendered as $0.0000."""
+    if recorded_runs == 0 or actual_cost_usd is None:
+        return f"{label}: {recorded_runs} run(s), no spend recorded"
+    line = f"{label}: {recorded_runs} run(s), actual ${actual_cost_usd:.4f}"
+    if overage_usd is not None:
+        line += f", overage ${overage_usd:.4f}"
+    if within_ceiling is not None:
+        line += ", within ceiling" if within_ceiling else ", OVER CEILING"
+    return line
+
+
+def _render_sync_status(statuses: list[RemoteStatus], merged: MergedSpend) -> str:
+    """Render per-remote states plus the merged, attributed spend view."""
+    lines: list[str] = []
+    for status in statuses:
+        if not status.ok:
+            lines.append(f"- {status.label}: REFUSED — {status.refusal}")
+            continue
+        remote = status.remote
+        overview = status.overview
+        if remote is None or overview is None or status.spend is None:
+            lines.append(
+                f"- {status.label}: REFUSED — incomplete status from the remote"
+            )
+            continue
+        lines.append(
+            f"- {status.label} (store '{remote.store}'): "
+            f"{overview.total_decisions} decision(s), {overview.promoted} promoted, "
+            f"{overview.pending_approvals} pending approval(s)"
+        )
+        spend = status.spend
+        lines.append(
+            "  spend: "
+            + _spend_line(
+                "this machine",
+                spend.recorded_runs,
+                spend.actual_cost_usd,
+                spend.overage_usd,
+                spend.within_ceiling,
+            )
+        )
+    refused = any(not status.ok for status in statuses)
+    lines.append("")
+    if not merged.machines:
+        lines.append(
+            "merged spend: no remote reported — nothing is summed (absence is not zero)"
+        )
+        return "\n".join(lines)
+    qualifier = " — refusals are never summed away" if refused else ""
+    lines.append(
+        f"merged spend ({len(merged.machines)} of {len(statuses)} machine(s) "
+        f"reporting{qualifier}):"
+    )
+    for machine in merged.machines:
+        lines.append(
+            "  "
+            + _spend_line(
+                machine.remote,
+                machine.recorded_runs,
+                machine.actual_cost_usd,
+                machine.overage_usd,
+                machine.within_ceiling,
+            )
+        )
+    if merged.total_actual_cost_usd is None:
+        lines.append("  total: no spend recorded on any reporting machine")
+    else:
+        total = f"  total: {merged.recorded_runs} run(s), actual ${merged.total_actual_cost_usd:.4f}"
+        if merged.total_overage_usd is not None:
+            total += f", overage ${merged.total_overage_usd:.4f}"
+        if merged.within_ceiling is not None:
+            total += ", within ceiling" if merged.within_ceiling else ", OVER CEILING"
+        lines.append(total)
+    return "\n".join(lines)
+
+
+def _sync_transfer(
+    operation: str, remote_name: str | None, root: str | None, *, config_path: str | None
+) -> int:
+    """Push or pull one store over a configured remote's transport.
+
+    Both directions fail closed: an unknown or ambiguous ``--remote``, an
+    endpoint without a store name, an unreachable daemon, a dirty or
+    zero-history local store, a non-fast-forward push, and a conflicting
+    merge each refuse with the remote named — nothing is written.
+    """
+    cfg_path = Path(config_path) if config_path is not None else default_config_path()
+    try:
+        profile = load_config(cfg_path).profile()
+        remote = resolve_remote(profile.sync.endpoints, remote_name)
+        store_root = (
+            Path(root) if root is not None else Path(profile.store.learning_root)
+        )
+        result: PushResult | PullResult
+        if operation == "push":
+            result = push_store(store_root, remote)
+        else:
+            result = pull_store(store_root, remote)
+    except ConfigError as exc:
+        return _refuse(str(exc))
+    except SyncClientError as exc:
+        return _refuse(str(exc))
+    if isinstance(result, PushResult):
+        print(
+            f"sync push: transferred {result.head[:12]} to {result.url} ({result.ref})"
+        )
+        print(f"  store root: {store_root}")
+        if result.uncommitted:
+            print(
+                f"note: {result.uncommitted} uncommitted change(s) exist only on this "
+                "machine — nothing is published until the store's lifecycle commands "
+                "commit them"
+            )
+        return 0
+    print(
+        f"sync pull: merged the hosted store '{result.store}' from remote "
+        f"'{result.remote}' — local HEAD is now {result.head[:12]}"
+    )
+    print(f"  store root: {store_root}")
     return 0

@@ -183,9 +183,10 @@ jobs:
       # Measured at 97% at introduction; the 95% floor is the sync package's
       # own requirement, matching the repo's floor-slightly-below-measured
       # convention so meaningful erosion is blocked without flaking.
-      - name: Sync daemon tests with package coverage floor
+      - name: Sync daemon and client tests with package coverage floor
         run: >
           pytest tests/test_sync_settings.py tests/test_sync_queries.py
           tests/test_sync_binding.py tests/test_sync_server.py
-          tests/test_sync_transport.py tests/test_sync_merge.py -q
+          tests/test_sync_transport.py tests/test_sync_merge.py
+          tests/test_sync_client.py -q
           --cov=evogine.sync --cov-report=term-missing --cov-fail-under=95

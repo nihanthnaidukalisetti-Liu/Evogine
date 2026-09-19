@@ -4,15 +4,36 @@ build-backend = "hatchling.build"
 
 [project]
 name = "evogine"
-version = "0.1.0"
-description = "Self-evolving agentic engine: git-backed learning, builder/verifier/reflector swarm, two objective gates, decay-pressure benchmark."
+# Single version source: bump here only — tests/test_version_parity.py fails
+# on drift between this field and the package __version__.
+version = "4.0.0"
+description = "Self-evolving agentic engine: git-backed learning, builder/verifier/reflector swarm, two objective gates, a decay-pressure benchmark, a localhost operator console, federated cross-project memory, and a git-native sync daemon."
 readme = "README.md"
 requires-python = ">=3.12"
+authors = [
+    { name = "Nihanth Naidu Kalisetti", email = "nihanthnaidu008@gmail.com" },
+]
+keywords = ["agentic", "self-evolving", "code-repair", "learning", "swarm"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Quality Assurance",
+    "Typing :: Typed",
+]
 dependencies = [
     "anthropic",
     "pydantic>=2",
     "pyyaml",
 ]
+
+[project.urls]
+Homepage = "https://github.com/nihanthnaidukalisetti-Liu/Evogine"
+Repository = "https://github.com/nihanthnaidukalisetti-Liu/Evogine"
+Changelog = "https://github.com/nihanthnaidukalisetti-Liu/Evogine/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 docker = [

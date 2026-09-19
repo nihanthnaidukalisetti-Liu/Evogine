@@ -1,11 +1,13 @@
-"""evogine: a self-evolving agentic engine (v1 scaffold).
+"""evogine: a self-evolving agentic engine.
 
 A git-backed knowledge engine + builder/verifier/reflector swarm + two
-objective gates + decay-pressure benchmark. This module is the installable
-package root; the v1 design spec defines the full architecture.
+objective gates + decay-pressure benchmark, with a localhost operator
+console, federated cross-project memory, and a git-native sync daemon.
+This module is the installable package root; pyproject.toml holds the
+release version (tests/test_version_parity.py enforces parity).
 """
 
-__version__ = "0.1.0"
+__version__ = "4.0.0"
 
 from evogine.engine.records import LearningRecord
 

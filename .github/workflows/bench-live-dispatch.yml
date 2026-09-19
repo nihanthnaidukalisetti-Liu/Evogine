@@ -1,0 +1,217 @@
+name: Live benchmark (manual dispatch)
+
+# Live benchmark — manual dispatch only (the V3 W0 spend seam).
+#
+# This workflow is the ONLY place a live model call may happen in CI: it
+# carries the provider key and drives `evogine bench --runner live`, the
+# protocol-gated live path. Ordinary CI (.github/workflows/ci.yml) keeps
+# its no-secrets, no-live-calls contract unchanged — this file adds no
+# dependencies to it and touches nothing it does.
+#
+# Deliberate-dispatch runbook
+# ---------------------------
+# 1. Pin the run constants first (edit THIS file in a reviewed commit):
+#    EVOGINE_LIVE_MODEL, the expected per-replay token counts, and the
+#    per-mtok USD prices. They ship as unmistakable REPLACE-* placeholders
+#    that every gate below refuses — a dispatch can never quietly spend
+#    against an unpinned model or a zeroed price (a zero price projects
+#    zero and silently disarms the dollar ceiling).
+# 2. Store the provider key as the repository secret ANTHROPIC_API_KEY
+#    (Settings > Secrets and variables > Actions), ideally restricted to a
+#    protected environment. The key exists only as a `secrets.` reference;
+#    it is never logged, never written to disk, and no key material is
+#    committed anywhere.
+# 3. Pre-register the protocol as a committed file in the repo: a protocol
+#    pins the corpus fingerprint, prompt pack, repeat count, and spend
+#    budgets, so the question asked of the live model is fixed before the
+#    run, not chosen at dispatch time.
+# 4. Run it: Actions > "Live benchmark (manual dispatch)" > Run workflow,
+#    then type the repo-relative protocol path and the dollar ceiling.
+#    The typed ceiling IS the spend confirmation: it has no default, and
+#    empty, non-numeric, or non-positive values refuse.
+# 5. Read the evidence: the run directory (per-call records and the
+#    reconciled spend report) uploads as a workflow artifact even when the
+#    run fails. Run directories are immutable once complete; an interrupted
+#    run can be resumed with the CLI's --run-id flag from the downloaded
+#    artifact on a later dispatch.
+#
+# Fail-closed posture
+# -------------------
+# - No automatic triggers: no push, no pull_request, no schedule. Only a
+#   human clicking "Run workflow" can start this job.
+# - Dispatch inputs reach the shell only as environment variables, never
+#   as interpolated script text.
+# - The guard step refuses unpinned constants, malformed or non-positive
+#   ceilings, and protocol paths that are absolute, escaping, or missing
+#   before anything runs; the CLI independently re-validates everything
+#   and refuses before the first dollar moves on a missing key, a missing
+#   protocol, a below-floor repeat count, a projected spend over the
+#   ceiling, or a contaminated holdout.
+# - The job runs with least privilege (contents: read), a hard timeout,
+#   and a concurrency group that serializes live runs instead of
+#   cancelling one mid-spend.
+
+on:
+  workflow_dispatch:
+    inputs:
+      protocol_path:
+        description: >-
+          Repo-relative path to the pre-registered protocol YAML
+          (e.g. protocols/v3-w0.yaml); must exist in the ref being run.
+        required: true
+        type: string
+      max_cost_usd:
+        description: >-
+          Spend ceiling in USD — type the ceiling to confirm it. No
+          default; empty or non-positive values refuse the run.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-bench
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  live-bench:
+    name: Live benchmark (deliberate dispatch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      # Run constants — pinned by reviewed commit, never typed at dispatch.
+      # The placeholders below are refused by the guard step and by the
+      # CLI's own validation; replace them before the first real dispatch.
+      EVOGINE_LIVE_MODEL: REPLACE-MODEL-ID-VIA-REVIEWED-COMMIT
+      EVOGINE_EXPECTED_INPUT_TOKENS: REPLACE-INPUT-TOKENS
+      EVOGINE_EXPECTED_OUTPUT_TOKENS: REPLACE-OUTPUT-TOKENS
+      EVOGINE_INPUT_PRICE_PER_MTOK_USD: REPLACE-INPUT-PRICE-USD
+      EVOGINE_OUTPUT_PRICE_PER_MTOK_USD: REPLACE-OUTPUT-PRICE-USD
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Pick the ephemeral run root
+        run: echo "RUN_ROOT=$RUNNER_TEMP/live-root" >> "$GITHUB_ENV"
+
+      # Operator-facing pre-flight: the typed ceiling is confirmed here and
+      # every pin is checked before install or spend. The CLI remains the
+      # authoritative fail-closed gate; this guard only makes refusals fast
+      # and legible.
+      - name: Confirm ceiling and pins (fail closed)
+        env:
+          PROTOCOL_PATH: ${{ inputs.protocol_path }}
+          SPEND_CEILING_USD: ${{ inputs.max_cost_usd }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import sys
+          from decimal import Decimal, InvalidOperation
+
+          def refuse(reason: str) -> None:
+              sys.exit(f"refusing: {reason} (nothing was spent; see the runbook "
+                       "comment at the top of this workflow)")
+
+          raw_ceiling = os.environ.get("SPEND_CEILING_USD", "").strip()
+          if not raw_ceiling:
+              refuse("the dollar ceiling is empty — type the ceiling to confirm it")
+          try:
+              ceiling = Decimal(raw_ceiling)
+          except InvalidOperation:
+              refuse(f"ceiling {raw_ceiling!r} is not a parseable dollar amount")
+          if ceiling <= 0:
+              refuse(f"ceiling must be positive, got {ceiling}")
+
+          protocol_path = os.environ.get("PROTOCOL_PATH", "").strip()
+          if not protocol_path:
+              refuse("the protocol path is empty")
+          if protocol_path.startswith(("/", "~")) or ".." in protocol_path.split(os.sep):
+              refuse(f"protocol path must be repo-relative and must not escape the checkout, got {protocol_path!r}")
+          if not os.path.isfile(protocol_path):
+              refuse(f"protocol file {protocol_path!r} does not exist in this ref")
+
+          constants = {
+              "EVOGINE_LIVE_MODEL": None,
+              "EVOGINE_EXPECTED_INPUT_TOKENS": "int",
+              "EVOGINE_EXPECTED_OUTPUT_TOKENS": "int",
+              "EVOGINE_INPUT_PRICE_PER_MTOK_USD": "price",
+              "EVOGINE_OUTPUT_PRICE_PER_MTOK_USD": "price",
+          }
+          for name, kind in constants.items():
+              value = os.environ.get(name, "").strip()
+              if not value or "REPLACE" in value:
+                  refuse(f"{name} is not pinned — edit this workflow's env block in a "
+                         "reviewed commit before dispatching a live run")
+              if kind == "int":
+                  try:
+                      count = int(value)
+                  except ValueError:
+                      refuse(f"{name}={value!r} is not an integer token count")
+                  if count <= 0:
+                      refuse(f"{name} must be positive, got {count}")
+              if kind == "price":
+                  try:
+                      price = Decimal(value)
+                  except InvalidOperation:
+                      refuse(f"{name}={value!r} is not a parseable USD price")
+                  if price <= 0:
+                      refuse(f"{name} must be positive — a zero price projects zero "
+                             "and silently disarms the dollar ceiling")
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("## Live benchmark (manual dispatch)\n\n")
+              summary.write(f"- protocol: `{protocol_path}`\n")
+              summary.write(f"- confirmed spend ceiling: **${ceiling}**\n")
+              summary.write(f"- model: `{os.environ['EVOGINE_LIVE_MODEL']}`\n")
+          print(f"confirmed: protocol={protocol_path} ceiling=${ceiling} "
+                f"model={os.environ['EVOGINE_LIVE_MODEL']}")
+          PY
+
+      - name: Install package
+        run: pip install -e "."
+
+      # The live spend seam. The key is read from the environment only; it
+      # is not echoed and never lands in the log, the run dir, or the repo.
+      # The CLI refuses before any model call when the key is absent, the
+      # protocol is missing or invalid, the projection exceeds the ceiling,
+      # or a holdout is contaminated.
+      - name: Live bench (protocol-gated, ceiling-capped)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PROTOCOL_PATH: ${{ inputs.protocol_path }}
+          SPEND_CEILING_USD: ${{ inputs.max_cost_usd }}
+        run: |
+          evogine bench \
+            --root "$RUN_ROOT" \
+            --runner live \
+            --protocol "$PROTOCOL_PATH" \
+            --model "$EVOGINE_LIVE_MODEL" \
+            --max-cost-usd "$SPEND_CEILING_USD" \
+            --expected-input-tokens "$EVOGINE_EXPECTED_INPUT_TOKENS" \
+            --expected-output-tokens "$EVOGINE_EXPECTED_OUTPUT_TOKENS" \
+            --input-price-per-mtok-usd "$EVOGINE_INPUT_PRICE_PER_MTOK_USD" \
+            --output-price-per-mtok-usd "$EVOGINE_OUTPUT_PRICE_PER_MTOK_USD"
+
+      # Evidence survives the outcome: per-call records and the reconciled
+      # spend report upload whether the bench passed, failed, or was
+      # refused mid-run. A refused-before-spend run has no run dir; the
+      # refusal itself lives in the step log above.
+      - name: Upload run evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-bench-run-${{ github.run_id }}
+          path: ${{ env.RUN_ROOT }}/runs/bench/**
+          if-no-files-found: warn

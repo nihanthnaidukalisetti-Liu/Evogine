@@ -119,7 +119,7 @@ class WorkerPoolSettings(BaseModel):
 
 
 class SyncEndpoint(BaseModel):
-    """One sync-daemon endpoint (forward-looking — Pillar C of V4)."""
+    """One sync-daemon endpoint: a daemon URL plus the store it hosts."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -128,9 +128,17 @@ class SyncEndpoint(BaseModel):
     """Where the daemon answers. ``HttpUrl`` pins the scheme to http(s) — a
     ``file://`` or bare-host entry refuses at load, never at probe time."""
 
+    store: str | None = None
+    """The hosted store this remote serves — the name ``evogine sync``
+    commands resolve against the daemon's registry. Optional so pre-sync
+    configs load unchanged (``evogine doctor`` still probes the URL); a
+    sync command against an endpoint without one refuses visibly — the
+    client never guesses a store name."""
+
 
 class SyncSettings(BaseModel):
-    """Sync endpoints the config declares; ``evogine doctor`` probes them."""
+    """Sync endpoints the config declares: ``evogine doctor`` probes their
+    reachability; ``evogine sync`` pushes/pulls the hosted store each names."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -254,13 +262,15 @@ profiles:
       min_workers: 1
       max_workers: 4
     sync:
-      # Forward-looking (V4 Pillar C): endpoints the sync daemon serves.
-      # 'evogine doctor' probes each URL's reachability; nothing consumes
-      # them yet.
+      # Sync endpoints (V4 Pillar C): 'evogine doctor' probes each URL's
+      # reachability; 'evogine sync status|push|pull' moves knowledge and
+      # rolls up spend across machines. 'store' names the hosted store the
+      # endpoint serves — sync commands refuse an endpoint without one.
       endpoints: []
       # endpoints:
       #   - name: laptop
-      #     url: http://127.0.0.1:8787
+      #     url: http://127.0.0.1:8766
+      #     store: alpha
     logging:
       level: info
       # 'json' renders one JSON object per line for log shippers and the

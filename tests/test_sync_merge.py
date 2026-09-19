@@ -24,17 +24,19 @@ BASE = '{"seq":1,"event":"propose","record_id":"lr-1"}\n'
 OURS_APPEND = '{"seq":2,"event":"propose","record_id":"lr-ours"}\n'
 THEIRS_APPEND = '{"seq":3,"event":"propose","record_id":"lr-theirs"}\n'
 
-# The driver command is environment-proof: it re-injects PYTHONPATH pointing
-# at this checkout's src/ tree and uses the running interpreter explicitly.
-# Git-spawned merge drivers run with the REPO's working directory, so a bare
+# The driver command is environment-proof and fork-free: it re-injects
+# PYTHONPATH pointing at this checkout's src/ tree and runs the interpreter
+# explicitly via exec, so dash replaces itself instead of forking a child.
+# Git-spawned merge drivers run with the REPO's working directory (a bare
 # `python3 -m evogine.sync.merge` loses the candidate tree whenever the
-# ambient environment does not already carry an importable evogine (the
+# ambient environment does not already carry an importable evogine — the
 # hermetic evaluator runs the suite uninstalled, imports resolved via
-# PYTHONPATH) — the driver then dies with ModuleNotFoundError and git
-# reports a bare conflict. sys.executable is the same interpreter running
-# the tests; SRC is this checkout's source root in any staging layout.
+# PYTHONPATH), and the evaluator's tight container limits have failed the
+# driver's fork with `sh: 1: Cannot fork`. exec keeps the driver inside
+# dash's existing process slot, and sys.executable is the same interpreter
+# running the tests; SRC is this checkout's source root in any layout.
 SRC = Path(__file__).resolve().parents[1] / "src"
-DRIVER = f"env PYTHONPATH={SRC} {sys.executable} -m evogine.sync.merge %O %A %B"
+DRIVER = f"exec env PYTHONPATH={SRC} {sys.executable} -m evogine.sync.merge %O %A %B"
 
 
 def test_disjoint_appends_keep_each_sides_order() -> None:

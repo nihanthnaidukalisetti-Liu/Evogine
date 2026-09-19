@@ -36,6 +36,20 @@ src/evogine/
 └── py.typed
 ```
 
+## Getting started
+
+```bash
+pip install -e .   # core, offline
+evogine init       # create the learning store, write a starter evogine.yaml, walk through provider key setup
+evogine doctor     # git, Docker, provider key, disk space, sync endpoints — every state explicit, with the fix
+```
+
+Configuration lives in one YAML file (`evogine.yaml`) with named profiles:
+store roots, provider settings, Decimal budget ceilings, worker-pool bounds,
+sync endpoints (forward-looking), and logging. The provider key is never
+stored in the file: it is read at run time from the environment variable
+named by `api_key_env`.
+
 ## Status
 
 The sandboxed code gate is implemented: candidate patches are staged

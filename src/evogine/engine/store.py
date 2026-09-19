@@ -39,6 +39,7 @@ from evogine.engine.records import (
 )
 from evogine.engine.retrieval import DEFAULT_FLOOR
 from evogine.engine.retrieval import retrieve as hybrid_retrieve
+from evogine.ops.compaction import load_index_if_fresh
 from evogine.ops.logging_setup import log_event
 from evogine.ops.metrics import NO_STATUS, STORE_TRANSITIONS_TOTAL, metrics
 from evogine.ops.migrations import (
@@ -263,8 +264,22 @@ class Engine:
 
     # ---------------------------------------------------------------- reads
 
+    def _records_with_status(self, status: str) -> list[LearningRecord] | None:
+        """Records with one status via the derived index, or ``None`` when the
+        index is absent/stale (the caller falls back to the honest full
+        scan). Derived state never changes results — only how many files
+        must be parsed to get them.
+        """
+        store_index = load_index_if_fresh(self.root)
+        if store_index is None:
+            return None
+        return [self._load(entry.id) for entry in store_index.entries if entry.status == status]
+
     def promoted_records(self) -> list[LearningRecord]:
         """All ``promoted`` records — the only pool retrieval may draw from."""
+        promoted = self._records_with_status("promoted")
+        if promoted is not None:
+            return promoted
         return [record for record in self._all_records() if record.status == "promoted"]
 
     def retrieve(
@@ -297,6 +312,9 @@ class Engine:
         exactly these and nothing else. Ordered by record id (records/
         glob order) so a pass is deterministic.
         """
+        candidates = self._records_with_status("candidate")
+        if candidates is not None:
+            return candidates
         return [record for record in self._all_records() if record.status == "candidate"]
 
     # ------------------------------------------------------------ lifecycle
@@ -462,12 +480,37 @@ class Engine:
         detection belongs to the retrieval layer (V2-3), not to a
         guess-prone heuristic here. Pairs come back ordered by id.
         """
-        live = [r for r in self._all_records() if r.status in _LIVE_STATUSES]
-        duplicates: list[tuple[str, str]] = []
-        for i, first in enumerate(live):
-            for second in live[i + 1 :]:
-                if first.type == second.type and first.body == second.body:
-                    duplicates.append((first.id, second.id))
+        store_index = load_index_if_fresh(self.root)
+        if store_index is not None:
+            # Index fast path: body equality is the four body fields, so
+            # pairwise tuple comparison over index entries is exactly the
+            # record-level comparison — with zero record files parsed.
+            # Entries are id-ordered, matching the full-scan pairing order.
+            indexed = [
+                (
+                    entry.id,
+                    entry.type,
+                    entry.signal,
+                    entry.failure_mode,
+                    entry.detection,
+                    entry.fix_strategy,
+                )
+                for entry in store_index.entries
+                if entry.status in _LIVE_STATUSES
+            ]
+            duplicates = [
+                (first[0], second[0])
+                for i, first in enumerate(indexed)
+                for second in indexed[i + 1 :]
+                if first[1:] == second[1:]
+            ]
+        else:
+            live = [r for r in self._all_records() if r.status in _LIVE_STATUSES]
+            duplicates = []
+            for i, first in enumerate(live):
+                for second in live[i + 1 :]:
+                    if first.type == second.type and first.body == second.body:
+                        duplicates.append((first.id, second.id))
         return duplicates
 
     def merge(self, primary_id: str, duplicate_id: str, reason: str) -> LearningRecord:

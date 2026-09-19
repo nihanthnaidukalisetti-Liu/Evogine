@@ -146,12 +146,16 @@ class SyncSettings(BaseModel):
 
 
 class LoggingSettings(BaseModel):
-    """Logging settings. Structured sinks are the operations wave; the level
-    is the knob that exists today."""
+    """Logging settings: level plus the sink format, consumed only by
+    :func:`evogine.ops.logging_setup.configure_logging` — the one entry
+    point that owns the root logger (no ``basicConfig`` anywhere else).
+    The structured JSON sink is the V4 operations wave; ``text`` stays
+    the default so interactive use is unchanged."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     level: Literal["debug", "info", "warning", "error"] = "info"
+    format: Literal["text", "json"] = "text"
 
 
 class ProfileSettings(BaseModel):
@@ -259,6 +263,9 @@ profiles:
       #     url: http://127.0.0.1:8787
     logging:
       level: info
+      # 'json' renders one JSON object per line for log shippers and the
+      # dashboard; 'text' (default) keeps human-oriented lines.
+      format: text
 """
 
 

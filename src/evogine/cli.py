@@ -70,6 +70,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from enum import Enum
 from pathlib import Path
 from urllib.error import HTTPError
@@ -140,6 +141,9 @@ from evogine.gates.telemetry import (
     RunsEvidenceSink,
     TelemetryError,
 )
+from evogine.ops.backup import BackupError, create_backup, restore_backup
+from evogine.ops.benchmark import BenchmarkError, run_benchmark
+from evogine.ops.compaction import CompactionError, compact_store
 
 # --- V4 swarm: repository decomposer (appended in its own section to ease rebases) ---
 from evogine.swarm.clients import AnthropicClient, ModelClient, RetryingModelClient
@@ -242,7 +246,9 @@ def main(argv: list[str] | None = None) -> int:
         "shadow",
         help="shadow-pass profiling of a candidate config — never mutates the store (V3 W2)",
     )
-    shadow_parser.add_argument("--root", required=True, help="engine store root to profile against (read-only)")
+    shadow_parser.add_argument(
+        "--root", required=True, help="engine store root to profile against (read-only)"
+    )
     shadow_parser.add_argument(
         "--candidate", required=True, help="path to the shadow candidate declaration (YAML)"
     )
@@ -335,9 +341,7 @@ def main(argv: list[str] | None = None) -> int:
         default="127.0.0.1",
         help="bind host; loopback only, anything else is refused (default: 127.0.0.1)",
     )
-    console_parser.add_argument(
-        "--port", type=int, default=8765, help="bind port (default: 8765)"
-    )
+    console_parser.add_argument("--port", type=int, default=8765, help="bind port (default: 8765)")
 
     # --- onboarding & config (V4 productization) ---------------------------
     # Appended as its own section so parallel CLI registrations merge cleanly.
@@ -431,6 +435,61 @@ def main(argv: list[str] | None = None) -> int:
         help="confirm the reviewed import; without it nothing is ever written",
     )
 
+    # --- store maintenance: backup/restore/compaction/benchmark (ops hardening) ---
+    store_parser = subparsers.add_parser(
+        "store", help="store maintenance: backup, restore, compaction, benchmark"
+    )
+    store_subparsers = store_parser.add_subparsers(dest="store_command", required=True)
+
+    store_backup_parser = store_subparsers.add_parser(
+        "backup", help="snapshot a store (including git history) into a tar archive"
+    )
+    store_backup_parser.add_argument("--root", required=True, help="engine store root to back up")
+    store_backup_parser.add_argument(
+        "--to",
+        required=True,
+        help="archive path to write (must live outside the store)",
+    )
+
+    store_restore_parser = store_subparsers.add_parser(
+        "restore", help="restore a store backup into an empty directory"
+    )
+    store_restore_parser.add_argument(
+        "--from", required=True, dest="from_archive", help="backup archive to restore"
+    )
+    store_restore_parser.add_argument(
+        "--to",
+        required=True,
+        help="destination directory (must be empty or absent)",
+    )
+
+    store_compact_parser = store_subparsers.add_parser(
+        "compact",
+        help="rebuild the derived index; preserves the audit trail and history",
+    )
+    store_compact_parser.add_argument("--root", required=True, help="engine store root to compact")
+
+    store_benchmark_parser = store_subparsers.add_parser(
+        "benchmark",
+        help="measure duplicate detection and retrieval before/after compaction "
+        "over a deterministic synthetic store",
+    )
+    store_benchmark_parser.add_argument(
+        "--records", type=int, default=10_000, help="synthetic record count (default: 10000)"
+    )
+    store_benchmark_parser.add_argument(
+        "--seed", type=int, default=0, help="deterministic generation seed (default: 0)"
+    )
+    store_benchmark_parser.add_argument(
+        "--repeats", type=int, default=3, help="measurement repetitions per phase (default: 3)"
+    )
+    store_benchmark_parser.add_argument(
+        "--dir",
+        default=None,
+        dest="store_dir",
+        help="directory for the synthetic store (default: a fresh temp dir)",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "run":
         return _run(args.root, repeats=args.repeats)
@@ -483,6 +542,19 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "memory" and args.memory_command == "import":
         return _memory_import(
             args.store, args.root, bundle_path=args.bundle, confirmed=args.confirmed
+        )
+    if args.command == "store" and args.store_command == "backup":
+        return _store_backup(args.root, args.to)
+    if args.command == "store" and args.store_command == "restore":
+        return _store_restore(args.from_archive, args.to)
+    if args.command == "store" and args.store_command == "compact":
+        return _store_compact(args.root)
+    if args.command == "store" and args.store_command == "benchmark":
+        return _store_benchmark(
+            args.records,
+            seed=args.seed,
+            repeats=args.repeats,
+            store_dir=args.store_dir,
         )
     return 0  # unreachable: subcommands are required
 
@@ -777,9 +849,7 @@ def _shadow(root: str, *, candidate_path: str, runs_root: str | None, repeats: i
     print(f"  cold pass rate: {summary.cold_pass_rate:.3f}")
     print(f"  warm pass rate: {summary.warm_pass_rate:.3f}")
     print(f"  mean delta:     {summary.mean_delta_pass_rate:+.3f}")
-    print(
-        f"  heldout recall probe: clean ({report.contamination.probed_cases} case(s) probed)"
-    )
+    print(f"  heldout recall probe: clean ({report.contamination.probed_cases} case(s) probed)")
     print(f"  run: {report.run_ref} (complete — immutable)")
     return 0
 
@@ -834,25 +904,21 @@ def _render_funnel_table(report: FunnelReport, root: str) -> str:
     lines: list[str] = []
     counts = report.funnel
     lines.append(f"proposal funnel: {root}")
-    lines.append(f"  candidates:          {counts.candidates}  decided proposals (latest verdict each)")
     lines.append(
-        f"  replay-cleared:      {counts.replay_cleared}  replay flipped a verdict"
+        f"  candidates:          {counts.candidates}  decided proposals (latest verdict each)"
     )
+    lines.append(f"  replay-cleared:      {counts.replay_cleared}  replay flipped a verdict")
     lines.append(
         f"  materiality-cleared: {counts.materiality_cleared}  flip met the materiality threshold"
     )
     lines.append(
         f"  approved:            {counts.approved}  human approved (or applied) the proposal"
     )
-    lines.append(
-        f"  promoted:            {counts.promoted}  live in the promoted pool"
-    )
+    lines.append(f"  promoted:            {counts.promoted}  live in the promoted pool")
     lines.append(
         f"  gate errors:         {counts.gate_errors}  infrastructure — undecided, retryable"
     )
-    lines.append(
-        f"  proposals pending:   {counts.proposals_pending}  awaiting a human decision"
-    )
+    lines.append(f"  proposals pending:   {counts.proposals_pending}  awaiting a human decision")
     lines.append(
         f"  proposals rejected:  {counts.proposals_rejected}  refused at the approval boundary"
     )
@@ -872,9 +938,7 @@ def _render_funnel_table(report: FunnelReport, root: str) -> str:
         lines.append(f"passes: {len(report.passes)}")
         for entry in report.passes:
             lines.append(f"  {entry.pass_id}:")
-            lines.append(
-                f"    candidates: {entry.candidates}, decisions: {entry.decisions}"
-            )
+            lines.append(f"    candidates: {entry.candidates}, decisions: {entry.decisions}")
             lines.append(
                 f"    replay-cleared: {entry.replay_cleared}, "
                 f"materiality-cleared: {entry.materiality_cleared}"
@@ -1016,9 +1080,7 @@ def _check_git() -> CheckResult:
         "repository; nothing runs without it"
     )
     try:
-        proc = subprocess.run(
-            ["git", "--version"], capture_output=True, text=True, check=False
-        )
+        proc = subprocess.run(["git", "--version"], capture_output=True, text=True, check=False)
     except OSError as exc:  # FileNotFoundError: no git on PATH
         return CheckResult(
             check="git",
@@ -1408,4 +1470,55 @@ def _memory_import(store: str, root: str, *, bundle_path: str, confirmed: bool) 
         f"import complete: {len(landed)} record(s) landed, provenance verbatim, "
         "recorded in the audit trail"
     )
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Store maintenance (V4 ops hardening): backup, restore, compaction, and the
+# compaction benchmark. Every refusal is an explicit error, never a shrug.
+
+
+def _store_backup(root: str, dest: str) -> int:
+    try:
+        result = create_backup(Path(root), Path(dest))
+    except BackupError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"backup: {result.archive} ({result.file_count} files, {result.archive_bytes} bytes)")
+    return 0
+
+
+def _store_restore(archive: str, dest: str) -> int:
+    try:
+        restored = restore_backup(Path(archive), Path(dest))
+    except BackupError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"restored: {restored}")
+    return 0
+
+
+def _store_compact(root: str) -> int:
+    try:
+        result = compact_store(Path(root))
+    except CompactionError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(
+        f"compacted: {result.record_count} records indexed into "
+        f"{result.index_path} ({result.index_bytes} bytes)"
+    )
+    return 0
+
+
+def _store_benchmark(records: int, *, seed: int, repeats: int, store_dir: str | None) -> int:
+    store_root = (
+        Path(store_dir) if store_dir else Path(tempfile.mkdtemp(prefix="evogine-benchmark-"))
+    )
+    try:
+        benchmark = run_benchmark(store_root, records, seed=seed, repeats=repeats)
+    except (BenchmarkError, StoreError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(benchmark.render())
     return 0

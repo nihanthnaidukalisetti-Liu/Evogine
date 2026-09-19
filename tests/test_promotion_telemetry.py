@@ -26,6 +26,20 @@ from evogine.gates.telemetry import (
     TelemetryError,
     check_reason,
 )
+from evogine.ops.metrics import (
+    FUNNEL_STAGE_TOTAL,
+    GATE_DECISIONS_TOTAL,
+    metrics,
+    reset_metrics,
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_metrics():
+    """Metric wiring tests read process-wide counters — reset around each."""
+    reset_metrics()
+    yield
+    reset_metrics()
 
 
 class ScriptedRunner:
@@ -106,6 +120,45 @@ def test_decision_log_rejects_evidence_outside_the_template(tmp_path: Path) -> N
     log = DecisionLog(tmp_path)
     with pytest.raises(TelemetryError, match="does not match the template"):
         log.record(decision(reason="no_flip: honestly nothing changed"))
+
+
+def test_recorded_decisions_increment_gate_and_funnel_counters(tmp_path: Path) -> None:
+    log = DecisionLog(tmp_path)
+    log.record(
+        decision(
+            proposal_id="prop-a",
+            learning_id="prop-a",
+            stage=DecisionStage.REPLAY,
+            reason="no_flip: 0/3 replays changed verdict",
+        )
+    )
+    log.record(
+        decision(
+            proposal_id="prop-b",
+            learning_id="prop-b",
+            promoted=True,
+            stage=DecisionStage.NEVER_WORSE,
+            reason="cleared: 2 binary flips",
+        )
+    )
+
+    snapshot = metrics().snapshot()
+    assert snapshot.counter(GATE_DECISIONS_TOTAL, {"stage": "replay", "promoted": "false"}) == 1
+    assert snapshot.counter(GATE_DECISIONS_TOTAL, {"stage": "never_worse", "promoted": "true"}) == 1
+    assert snapshot.counter(FUNNEL_STAGE_TOTAL, {"stage": "replay"}) == 1
+    assert snapshot.counter(FUNNEL_STAGE_TOTAL, {"stage": "never_worse"}) == 1
+
+
+def test_refused_decision_records_are_never_counted(tmp_path: Path) -> None:
+    log = DecisionLog(tmp_path)
+    with pytest.raises(TelemetryError):
+        log.record(decision(reason="it did not flip at all"))
+
+    # Metrics count durable decisions only — a refused record is persisted
+    # nowhere and counted nowhere.
+    snapshot = metrics().snapshot()
+    assert snapshot.counter(GATE_DECISIONS_TOTAL) == 0
+    assert snapshot.counter(FUNNEL_STAGE_TOTAL) == 0
 
 
 def test_check_reason_accepts_the_spec_example() -> None:
@@ -273,9 +326,7 @@ def test_promotion_pass_records_exactly_one_decision_per_proposal(
     assert len(by_proposal) == len(set(by_proposal))
 
 
-def test_promotion_pass_hit_every_decision_stage(
-    store: Engine, candidates_in_store
-) -> None:
+def test_promotion_pass_hit_every_decision_stage(store: Engine, candidates_in_store) -> None:
     """Stages are enumerable: the pass corpus exercises all five."""
     decisions = promotion_pass_over(store)
 
@@ -291,9 +342,7 @@ def test_promotion_pass_reasons_all_match_their_stage_templates(
         check_reason(d.stage, d.reason)  # raises if a reason left the vocabulary
 
 
-def test_promotion_pass_applies_lifecycle_verdicts(
-    store: Engine, candidates_in_store
-) -> None:
+def test_promotion_pass_applies_lifecycle_verdicts(store: Engine, candidates_in_store) -> None:
     """Cleared candidates render proposals (no promotion); rejects demote."""
     decisions = promotion_pass_over(store)
     by_id = {d.proposal_id: d for d in decisions}
@@ -336,9 +385,7 @@ def test_promotion_pass_writes_evidence_for_replayed_proposals(
         assert d.replay_run_ids[0] in evidence_file.read_text(encoding="utf-8")
 
 
-def test_engine_candidates_lists_only_queued_records(
-    store: Engine, record_factory
-) -> None:
+def test_engine_candidates_lists_only_queued_records(store: Engine, record_factory) -> None:
     store.propose(record_factory("lr-ephemeral"))
     store.propose(record_factory("lr-queued"))
     store.queue_replay("lr-queued", ["run-1"])

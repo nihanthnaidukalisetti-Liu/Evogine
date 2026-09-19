@@ -17,6 +17,7 @@ store commits can never sweep up unrelated files.
 from __future__ import annotations
 
 import fcntl
+import logging
 import os
 import re
 import subprocess
@@ -38,6 +39,16 @@ from evogine.engine.records import (
 )
 from evogine.engine.retrieval import DEFAULT_FLOOR
 from evogine.engine.retrieval import retrieve as hybrid_retrieve
+from evogine.ops.compaction import load_index_if_fresh
+from evogine.ops.logging_setup import log_event
+from evogine.ops.metrics import NO_STATUS, STORE_TRANSITIONS_TOTAL, metrics
+from evogine.ops.migrations import (
+    CURRENT_SCHEMA_VERSION,
+    SchemaError,
+    SchemaState,
+    ensure_openable,
+    write_schema,
+)
 
 # Ids become filenames under ``records/``: lock them to filesystem- and
 # git-safe characters so a malicious proposal can never traverse paths
@@ -50,6 +61,10 @@ _ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 # a qualified id ``<store-name>:<record-id>`` splits unambiguously on the
 # first colon (docs/cross-project-memory.md, invariant 3.4).
 _STORE_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+
+#: Library-side logger: the engine only emits; formatting/level/sink belong
+#: to the config module's settings via the ops logging entry point.
+logger = logging.getLogger(__name__)
 
 #: Identity of a standalone store that was never given a name. Federation
 #: registries always pass an explicit name; the default keeps the
@@ -224,8 +239,23 @@ class Engine:
         self.records_dir = self.root / "records"
         self.audit_path = self.root / "audit.jsonl"
         self.records_dir.mkdir(parents=True, exist_ok=True)
-        if not (self.root / ".git").exists():
+        fresh_store = not (self.root / ".git").exists()
+        if fresh_store:
             _git(self.root, "init", "-q")
+        # Schema gate (V4 ops): a store written by NEWER code is refused
+        # here — reading a schema this build does not understand is how
+        # silent corruption happens; refusing is the visible alternative.
+        # Legacy stores (predating the stamp) read as version 1 and keep
+        # working unchanged; only fresh stores write a stamp, born current.
+        try:
+            ensure_openable(self.root)
+        except SchemaError as exc:
+            raise StoreError(str(exc)) from exc
+        if fresh_store:
+            write_schema(
+                self.root,
+                SchemaState(version=CURRENT_SCHEMA_VERSION, updated_at=_now()),
+            )
         # The review lock file exists from store birth so the first lifecycle
         # commit versions it — a lock file created lazily could be left
         # untracked by a refused boundary action (no commit follows a refusal).
@@ -234,8 +264,22 @@ class Engine:
 
     # ---------------------------------------------------------------- reads
 
+    def _records_with_status(self, status: str) -> list[LearningRecord] | None:
+        """Records with one status via the derived index, or ``None`` when the
+        index is absent/stale (the caller falls back to the honest full
+        scan). Derived state never changes results — only how many files
+        must be parsed to get them.
+        """
+        store_index = load_index_if_fresh(self.root)
+        if store_index is None:
+            return None
+        return [self._load(entry.id) for entry in store_index.entries if entry.status == status]
+
     def promoted_records(self) -> list[LearningRecord]:
         """All ``promoted`` records — the only pool retrieval may draw from."""
+        promoted = self._records_with_status("promoted")
+        if promoted is not None:
+            return promoted
         return [record for record in self._all_records() if record.status == "promoted"]
 
     def retrieve(
@@ -268,6 +312,9 @@ class Engine:
         exactly these and nothing else. Ordered by record id (records/
         glob order) so a pass is deterministic.
         """
+        candidates = self._records_with_status("candidate")
+        if candidates is not None:
+            return candidates
         return [record for record in self._all_records() if record.status == "candidate"]
 
     # ------------------------------------------------------------ lifecycle
@@ -433,12 +480,37 @@ class Engine:
         detection belongs to the retrieval layer (V2-3), not to a
         guess-prone heuristic here. Pairs come back ordered by id.
         """
-        live = [r for r in self._all_records() if r.status in _LIVE_STATUSES]
-        duplicates: list[tuple[str, str]] = []
-        for i, first in enumerate(live):
-            for second in live[i + 1 :]:
-                if first.type == second.type and first.body == second.body:
-                    duplicates.append((first.id, second.id))
+        store_index = load_index_if_fresh(self.root)
+        if store_index is not None:
+            # Index fast path: body equality is the four body fields, so
+            # pairwise tuple comparison over index entries is exactly the
+            # record-level comparison — with zero record files parsed.
+            # Entries are id-ordered, matching the full-scan pairing order.
+            indexed = [
+                (
+                    entry.id,
+                    entry.type,
+                    entry.signal,
+                    entry.failure_mode,
+                    entry.detection,
+                    entry.fix_strategy,
+                )
+                for entry in store_index.entries
+                if entry.status in _LIVE_STATUSES
+            ]
+            duplicates = [
+                (first[0], second[0])
+                for i, first in enumerate(indexed)
+                for second in indexed[i + 1 :]
+                if first[1:] == second[1:]
+            ]
+        else:
+            live = [r for r in self._all_records() if r.status in _LIVE_STATUSES]
+            duplicates = []
+            for i, first in enumerate(live):
+                for second in live[i + 1 :]:
+                    if first.type == second.type and first.body == second.body:
+                        duplicates.append((first.id, second.id))
         return duplicates
 
     def merge(self, primary_id: str, duplicate_id: str, reason: str) -> LearningRecord:
@@ -793,6 +865,27 @@ class Engine:
         stamped = event.model_copy(update={"seq": seq + 1, "ts": _now()})
         with self.audit_path.open("a", encoding="utf-8") as fh:
             fh.write(stamped.model_dump_json() + "\n")
+        # The transition counter rides the audit choke point: every
+        # lifecycle event is counted exactly once, with the status
+        # transition it made. The same event goes to the structured log.
+        metrics().increment(
+            STORE_TRANSITIONS_TOTAL,
+            {
+                "event": event.event,
+                "from_status": event.from_status or NO_STATUS,
+                "to_status": event.to_status,
+            },
+        )
+        log_event(
+            logger,
+            logging.INFO,
+            "store.transition",
+            f"{event.event} {event.record_id}: {event.from_status or NO_STATUS} -> {event.to_status}",
+            event=event.event,
+            record_id=event.record_id,
+            from_status=event.from_status or NO_STATUS,
+            to_status=event.to_status,
+        )
 
     def _all_records(self) -> list[LearningRecord]:
         return [

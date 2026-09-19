@@ -10,7 +10,7 @@ import json
 import threading
 import time
 from collections.abc import Iterator
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 from pydantic import ValidationError
@@ -41,6 +41,19 @@ def _error_body(type_: str, message: str) -> dict[str, object]:
     return {"type": "error", "error": {"type": type_, "message": message}}
 
 
+class _StubServer(HTTPServer):
+    """Deliberately single-threaded stub server.
+
+    The CI gate container runs suites under tight process limits and denies
+    per-connection thread spawns under load ("can't start new thread"),
+    which surfaces client-side as connection errors instead of the scripted
+    responses. A sequential server needs one thread total (serve_forever);
+    concurrent arrivals queue in the (generous) listen backlog instead.
+    """
+
+    request_queue_size = 64
+
+
 class StubAnthropicAPI:
     """Scriptable loopback stub of the Anthropic Messages API.
 
@@ -51,7 +64,7 @@ class StubAnthropicAPI:
         self._lock = threading.Lock()
         self._script: list[tuple[int, dict[str, object], float, dict[str, str]]] = []
         self._requests: list[dict[str, object]] = []
-        self._server = ThreadingHTTPServer(("127.0.0.1", 0), _handler_for(self))
+        self._server = _StubServer(("127.0.0.1", 0), _handler_for(self))
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
 
@@ -99,13 +112,21 @@ def _handler_for(api: StubAnthropicAPI) -> type[BaseHTTPRequestHandler]:
             if delay:
                 time.sleep(delay)
             data = json.dumps(payload).encode()
-            self.send_response(status)
-            for key, value in extra.items():
-                self.send_header(key, value)
-            self.send_header("content-type", "application/json")
-            self.send_header("content-length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
+            try:
+                self.send_response(status)
+                for key, value in extra.items():
+                    self.send_header(key, value)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                # The client timed out and hung up while this handler was
+                # still working (e.g. the scripted delay outlived the client's
+                # timeout under a loaded runner). Abandon the response quietly
+                # instead of surfacing a BrokenPipe traceback; the test asserts
+                # on the client side.
+                return
 
         def log_message(self, format: str, *args: object) -> None:
             return  # keep test output clean
@@ -227,6 +248,13 @@ def test_timeout_is_transient_and_retried(stub_api: StubAnthropicAPI) -> None:
     with pytest.raises(ModelTransientError, match="timed out"):
         client.complete(ModelRequest(system="s", user="u"))
 
+    # The retry contract is pinned client-side above; this assertion only
+    # checks both attempts reached the stub, and with a sequential stub the
+    # second request is read after the first handler's scripted delay drains,
+    # so wait (bounded) instead of assuming instant server-side visibility.
+    deadline = time.monotonic() + 5.0
+    while len(stub_api.requests()) < 2 and time.monotonic() < deadline:
+        time.sleep(0.02)
     assert len(stub_api.requests()) == 2  # both attempts reached the stub
 
 

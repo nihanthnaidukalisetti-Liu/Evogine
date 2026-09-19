@@ -44,6 +44,18 @@ from evogine.engine.retrieval import retrieve as hybrid_retrieve
 # (the security review's staging-traversal lesson, applied at the boundary).
 _ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
+# Store identity (V4 federation): a store's identity is its configured
+# name after normalization (trimmed, lowercase), locked to the same
+# filesystem-safe grammar lowercased. ``:`` is excluded on both sides so
+# a qualified id ``<store-name>:<record-id>`` splits unambiguously on the
+# first colon (docs/cross-project-memory.md, invariant 3.4).
+_STORE_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+
+#: Identity of a standalone store that was never given a name. Federation
+#: registries always pass an explicit name; the default keeps the
+#: single-store engine (CLI, console, swarm) exactly as it was.
+DEFAULT_STORE_NAME = "local"
+
 #: The advisory lock file at the store root. The store's own git repo tracks
 #: it from the first lifecycle commit, so no runtime file is ever left
 #: untracked (the porcelain-clean property the audit tests pin); ``flock``
@@ -88,6 +100,48 @@ class StoreError(Exception):
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+# ------------------------------------------------------- v4: store identity
+
+
+def normalize_store_name(name: str) -> str:
+    """Normalize a configured store name to its identity: trimmed, lowercase.
+
+    A store identity *is* its configured name after normalization (the V4
+    pinned contract): ``"Alpha "`` and ``"alpha"`` are the same store, so
+    references and dispatch can never drift on case or whitespace. Names
+    outside the safe grammar after normalization are refused before any
+    store is ever constructed on them.
+    """
+    normalized = name.strip().lower()
+    if not _STORE_NAME_PATTERN.fullmatch(normalized):
+        raise StoreError(
+            f"store name {name!r} must match {_STORE_NAME_PATTERN.pattern} after normalization"
+        )
+    return normalized
+
+
+def split_qualified_id(qualified_id: str) -> tuple[str, str]:
+    """Split a qualified record id ``<store-name>:<record-id>`` into its parts.
+
+    Splits on the first ``:`` — store names and record ids are both
+    grammar-locked to exclude it, so the split is unambiguous. The store
+    part is normalized (identities are lowercase); the record part must
+    match the same id grammar the store enforces for its own records.
+    Raises :class:`StoreError` when the id is not qualified at all or
+    either half is malformed: an unparseable qualified id is never
+    silently treated as a local id.
+    """
+    store_name, separator, record_id = qualified_id.partition(":")
+    if not separator:
+        raise StoreError(
+            f"not a qualified id (expected <store-name>:<record-id>): {qualified_id!r}"
+        )
+    normalized = normalize_store_name(store_name)
+    if not _ID_PATTERN.fullmatch(record_id):
+        raise StoreError(f"record id in {qualified_id!r} must match {_ID_PATTERN.pattern}")
+    return normalized, record_id
 
 
 class AuditEvent(BaseModel):
@@ -146,7 +200,17 @@ class Engine:
     stays in the store, auditable, never deleted.
     """
 
-    def __init__(self, root: Path | str, embedder: Embedder | None = None) -> None:
+    def __init__(
+        self,
+        root: Path | str,
+        embedder: Embedder | None = None,
+        *,
+        name: str = DEFAULT_STORE_NAME,
+    ) -> None:
+        # The store's federation identity (V4): validated and normalized
+        # before anything touches the filesystem — a store can never exist
+        # under an ambiguous name.
+        self.store_name = normalize_store_name(name)
         self.root = Path(root)
         self.embedder: Embedder = embedder if embedder is not None else HashingEmbedder()
         self.records_dir = self.root / "records"
@@ -222,10 +286,17 @@ class Engine:
             )
         if draft.promoted_at is not None:
             raise StoreError(f"draft {draft.id} is pre-stamped promoted_at; only promote stamps it")
+        if ":" in draft.id:
+            raise StoreError(
+                f"record id {draft.id!r} is qualified; a store's own record ids are "
+                "unqualified — the <store-name>:<record-id> form is reserved for "
+                "cross-scope references"
+            )
         if not _ID_PATTERN.fullmatch(draft.id):
             raise StoreError(f"record id {draft.id!r} must match {_ID_PATTERN.pattern}")
         if self._record_path(draft.id).exists():
             raise StoreError(f"record already exists: {draft.id}")
+        self._validate_cross_references(draft)
         record = draft.model_copy(update={"status": "ephemeral"})
         self._save(record)
         self._append_audit(AuditEvent(event="propose", record_id=record.id, to_status="ephemeral"))
@@ -555,10 +626,53 @@ class Engine:
         return self.records_dir / f"{learning_id}.json"
 
     def _load(self, learning_id: str) -> LearningRecord:
+        # The read-side scope boundary (V4): a qualified id names a record
+        # in another store. This store cannot serve it — it holds only its
+        # own rows — and must not pretend to look for it; the federation
+        # router dispatches qualified ids to their own scope.
+        if ":" in learning_id:
+            raise StoreError(
+                f"qualified id {learning_id!r} names a record outside this store; "
+                "read it from its own store (or the federation router), not this one"
+            )
         path = self._record_path(learning_id)
         if not path.exists():
             raise StoreError(f"unknown learning id: {learning_id}")
         return LearningRecord.model_validate_json(path.read_text(encoding="utf-8"))
+
+    def _validate_cross_references(self, draft: LearningRecord) -> None:
+        """Validate every cross-record reference a write would persist (V4).
+
+        Record ids are unique only within one store
+        (docs/cross-project-memory.md §1.1), so an unqualified reference is
+        meaningful only as a local one: a reference to a record this store
+        does not hold is cross-scope by construction and must arrive
+        qualified ``<store-name>:<record-id>`` (invariant 3.4) — rejected
+        here, at write time, before anything is persisted. A qualified
+        reference to this store's own name is refused too: local references
+        are unqualified, and self-qualification would blur exactly the
+        boundary the qualifier exists to draw.
+        """
+        references = [source.record_id for source in draft.merged_sources]
+        if draft.merged_into is not None:
+            references.append(draft.merged_into)
+        for reference in references:
+            if ":" in reference:
+                referenced_store, _ = split_qualified_id(reference)
+                if referenced_store == self.store_name:
+                    raise StoreError(
+                        f"reference {reference!r} qualifies this store ({self.store_name}); "
+                        "local references are unqualified"
+                    )
+            else:
+                if not _ID_PATTERN.fullmatch(reference):
+                    raise StoreError(f"record id {reference!r} must match {_ID_PATTERN.pattern}")
+                if not self._record_path(reference).exists():
+                    raise StoreError(
+                        f"unqualified reference {reference!r} names no record in this "
+                        "store; cross-scope references must be qualified "
+                        "<store-name>:<record-id>"
+                    )
 
     def _save(self, record: LearningRecord) -> None:
         """Atomic write (tmp + rename) so a crash never leaves a torn record."""

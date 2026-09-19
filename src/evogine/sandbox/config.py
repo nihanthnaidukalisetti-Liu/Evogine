@@ -36,7 +36,11 @@ class SandboxConfig(BaseModel):
     cpus: float = 1.0
     pids_limit: int = 64
     timeout_seconds: float = 120.0
-    output_max_chars: int = 20_000
+    # CI-diagnostic: widened from 20000 so the candidate suite's FULL output
+    # (dots, sections, summary line) survives sanitization and reaches the
+    # verdict reason — sanitize_output keeps the FIRST N chars, and the gate
+    # takes the LAST 20KB of that window (revert after diagnosis).
+    output_max_chars: int = 500_000
     tmpfs_size: str = "64m"
     # Run as nobody:nogroup — the container is never root.
     container_user: str = "65534:65534"

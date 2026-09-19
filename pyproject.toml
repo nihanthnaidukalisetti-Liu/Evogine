@@ -26,6 +26,14 @@ console = [
     "uvicorn>=0.30",
     "jinja2>=3.1",
 ]
+# The sync daemon (evogine.sync) is transport, not core: it hosts store
+# repositories over git smart HTTP and serves the read/query API, loading
+# FastAPI and uvicorn only behind this extra. No jinja2 — the daemon speaks
+# JSON and git's own protocol, never HTML. The core install gains nothing.
+server = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+]
 dev = [
     "pytest",
     "pytest-cov",
@@ -39,6 +47,7 @@ dev = [
 
 [project.scripts]
 evogine = "evogine.cli:main"
+evogine-syncd = "evogine.sync.server:main"
 
 [tool.ruff]
 line-length = 100
@@ -62,6 +71,13 @@ target-version = "py312"
 # The write-path suite skips the same way (the optional [console] extra is
 # absent in core CI jobs), so its imports follow the skip call by design.
 "tests/test_console_write.py" = ["E402"]
+# The sync-daemon suites skip the same way (the optional [server] extra is
+# absent in core CI jobs); their fastapi/uvicorn imports follow the skip
+# calls by design and run for real in the dedicated sync CI job.
+"tests/test_sync_binding.py" = ["E402"]
+"tests/test_sync_queries.py" = ["E402"]
+"tests/test_sync_server.py" = ["E402"]
+"tests/test_sync_transport.py" = ["E402"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/evogine"]

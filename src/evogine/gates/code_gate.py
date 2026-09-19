@@ -174,10 +174,16 @@ class DockerCaseEvaluator:
 #: startup, dependency imports, and collection alone cost more than a
 #: second, so a sub-second "suite green" is fabricated or hollow (zero
 #: tests collected) — and the gate fails it closed.
+#:
+#: PYTHONPATH must be ABSOLUTE: the staging tree is always mounted at
+#: ``/workspace`` (``container_workspace``), but candidate tests legitimately
+#: spawn subprocesses from other working directories (git merge drivers,
+#: script helpers) — those processes resolve a relative PYTHONPATH against
+#: their OWN cwd and lose the candidate tree from sys.path entirely.
 DEFAULT_SUITE = EvalCase(
     case_id="suite",
     command="python -m pytest -q -p no:cacheprovider",
-    env={"PYTHONPATH": "src"},
+    env={"PYTHONPATH": "/workspace/src"},
     min_pass_seconds=1.0,
 )
 

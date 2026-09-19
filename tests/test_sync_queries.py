@@ -13,6 +13,13 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+
+# The daemon is optional transport behind the [server] extra: the core CI
+# jobs never install it, so this module skips as a whole there (the console
+# precedent) and runs for real in the dedicated sync CI job. The imports
+# after the skip call are module-level-late by design.
+fastapi = pytest.importorskip("fastapi")
+
 from fastapi.testclient import TestClient
 
 from evogine.bench.budgets import SpendReconciliation
@@ -28,8 +35,6 @@ from evogine.gates.replay import ReplayRun
 from evogine.gates.telemetry import DecisionLog, RunsEvidenceSink
 from evogine.sync.app import create_app
 from evogine.sync.settings import SyncSettings
-
-fastapi = pytest.importorskip("fastapi")
 
 
 def binary_run(run_id: str, arm: str, outcomes: list[bool]) -> ReplayRun:

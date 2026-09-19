@@ -12,9 +12,15 @@ from pathlib import Path
 
 import pytest
 
-from evogine.sync.server import main as syncd_main
-
+# The daemon is optional transport behind the [server] extra: the core CI
+# jobs never install it, so this module skips as a whole there (the console
+# precedent) and runs for real in the dedicated sync CI job. The sync server
+# entry imports uvicorn at module level, so both extras' packages must be
+# guarded. The import after the skip calls is module-level-late by design.
 fastapi = pytest.importorskip("fastapi")
+uvicorn = pytest.importorskip("uvicorn")
+
+from evogine.sync.server import main as syncd_main
 
 
 def test_cli_refuses_lan_bind_without_flag(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]

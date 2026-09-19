@@ -17,13 +17,19 @@ import time
 from pathlib import Path
 
 import pytest
-import uvicorn
+
+# The daemon is optional transport behind the [server] extra: the core CI
+# jobs never install it, so this module skips as a whole there (the console
+# precedent) and runs for real in the dedicated sync CI job. Both extras'
+# packages are guarded because the test drives a real uvicorn server. The
+# imports after the skip calls are module-level-late by design.
+fastapi = pytest.importorskip("fastapi")
+# importorskip returns the imported module, so this binding IS uvicorn.
+uvicorn = pytest.importorskip("uvicorn")
 
 from evogine.engine.store import Engine, store_lock
 from evogine.sync.app import create_app
 from evogine.sync.settings import SyncSettings
-
-fastapi = pytest.importorskip("fastapi")
 
 
 def _free_port() -> int:

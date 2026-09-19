@@ -13,14 +13,22 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+
+# The daemon is optional transport behind the [server] extra: the core CI
+# jobs never install it, so this module skips as a whole there (the console
+# precedent) and runs for real in the dedicated sync CI job. uvicorn is
+# guarded too: the serve() import pulls in evogine.sync.server, which
+# imports uvicorn at module level. The imports after the skip calls are
+# module-level-late by design.
+fastapi = pytest.importorskip("fastapi")
+uvicorn = pytest.importorskip("uvicorn")
+
 from fastapi.testclient import TestClient
 
 from evogine.engine.store import Engine
 from evogine.sync.app import create_app
 from evogine.sync.server import serve
 from evogine.sync.settings import SyncError, SyncSettings
-
-fastapi = pytest.importorskip("fastapi")
 
 
 @pytest.fixture()

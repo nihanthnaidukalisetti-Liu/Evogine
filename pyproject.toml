@@ -71,6 +71,13 @@ target-version = "py312"
 # The write-path suite skips the same way (the optional [console] extra is
 # absent in core CI jobs), so its imports follow the skip call by design.
 "tests/test_console_write.py" = ["E402"]
+# The sync-daemon suites skip the same way (the optional [server] extra is
+# absent in core CI jobs); their fastapi/uvicorn imports follow the skip
+# calls by design and run for real in the dedicated sync CI job.
+"tests/test_sync_binding.py" = ["E402"]
+"tests/test_sync_queries.py" = ["E402"]
+"tests/test_sync_server.py" = ["E402"]
+"tests/test_sync_transport.py" = ["E402"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/evogine"]

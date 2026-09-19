@@ -96,7 +96,8 @@ class CompactionResult(BaseModel):
     store_bytes_after: int
     head_before: str
     head_after: str
-    """HEAD is unchanged by compaction — asserted by the property tests."""
+    """HEAD moves exactly one index commit ahead; head_before stays an
+    ancestor of head_after — asserted by the property tests."""
 
 
 def index_path(root: Path | str) -> Path:

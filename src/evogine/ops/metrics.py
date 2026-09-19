@@ -54,8 +54,10 @@ STORE_TRANSITIONS_TOTAL = "evogine_store_transitions_total"
 #: ``stage`` / ``promoted``.
 GATE_DECISIONS_TOTAL = "evogine_gate_decisions_total"
 
-#: One per funnel-stage event (gate decisions and the approval boundary),
-#: labeled ``stage`` — the vocabulary the proposal funnel aggregates.
+#: One per durable funnel-stage event (``DecisionLog.record``), labeled
+#: ``stage`` — the vocabulary the proposal funnel aggregates. Human-boundary
+#: outcomes (approved→promoted, rejected→dropped) additionally surface as
+#: store transitions and in the ApprovalLog, never double-counted here.
 FUNNEL_STAGE_TOTAL = "evogine_funnel_stage_total"
 
 #: The label value used when a transition has no prior status (propose).

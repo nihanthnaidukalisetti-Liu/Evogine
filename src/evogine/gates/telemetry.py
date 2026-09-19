@@ -21,6 +21,8 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
+from evogine.ops.metrics import FUNNEL_STAGE_TOTAL, GATE_DECISIONS_TOTAL, metrics
+
 
 class DecisionStage(str, Enum):
     """The gate stage a decision came from.
@@ -126,7 +128,9 @@ STAGE_REASON_LABELS = _STAGE_REASON_LABELS
 
 _REASON_PATTERNS: dict[str, re.Pattern[str]] = {
     "no_flip": re.compile(r"no_flip: \d+/\d+ replays changed verdict"),
-    "not_material": re.compile(r"not_material: scored delta -?\d+\.\d{3} vs threshold \d+(?:\.\d+)?"),
+    "not_material": re.compile(
+        r"not_material: scored delta -?\d+\.\d{3} vs threshold \d+(?:\.\d+)?"
+    ),
     "regression": re.compile(r"regression: \d+ case\(s\) regressed(?:: .*)?"),
     "cleared": re.compile(
         r"cleared: (?:\d+ binary flips|scored delta -?\d+\.\d{3} vs threshold \d+(?:\.\d+)?)"
@@ -158,9 +162,7 @@ def check_reason(stage: DecisionStage, reason: str) -> None:
             f"allowed: {sorted(allowed)}"
         )
     if not _REASON_PATTERNS[label].fullmatch(reason):
-        raise TelemetryError(
-            f"reason {reason!r} does not match the template for label {label!r}"
-        )
+        raise TelemetryError(f"reason {reason!r} does not match the template for label {label!r}")
 
 
 # Same filesystem-safe id rule the store applies to record ids: decision
@@ -199,6 +201,16 @@ class DecisionLog:
         tmp = path.with_suffix(".json.tmp")
         tmp.write_text(decision.model_dump_json(indent=2) + "\n", encoding="utf-8")
         os.replace(tmp, path)
+        # Metrics count durable decisions only: a refused record (bad reason,
+        # bad id, failed write) is persisted nowhere and counted nowhere.
+        metrics().increment(
+            GATE_DECISIONS_TOTAL,
+            {
+                "stage": decision.stage.value,
+                "promoted": "true" if decision.promoted else "false",
+            },
+        )
+        metrics().increment(FUNNEL_STAGE_TOTAL, {"stage": decision.stage.value})
 
     def all(self) -> list[PromotionDecision]:
         """Every recorded decision, ordered by proposal id."""
@@ -232,13 +244,9 @@ class RunsEvidenceSink:
 
     def write(self, proposal_id: str, payload: Mapping[str, object]) -> str:
         if not _ID_PATTERN.fullmatch(proposal_id):
-            raise TelemetryError(
-                f"proposal id {proposal_id!r} must match {_ID_PATTERN.pattern}"
-            )
+            raise TelemetryError(f"proposal id {proposal_id!r} must match {_ID_PATTERN.pattern}")
         gate_dir = self.root / "runs" / "gate"
         gate_dir.mkdir(parents=True, exist_ok=True)
         path = gate_dir / f"{proposal_id}.json"
-        path.write_text(
-            json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         return f"runs/gate/{proposal_id}.json"

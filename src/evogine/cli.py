@@ -47,6 +47,19 @@ read from the environment by name and never echoed or stored.
 provider key, disk, sync endpoints — with every state explicit (ok /
 warn / fail, each with its fix where one exists), exiting non-zero only
 when a check fails.
+
+``memory export`` (V4 federation) writes an export bundle of a store's
+promoted pool — a manifest with per-record qualified ids plus the verbatim
+record payloads, the ``MergedSource`` provenance pattern extended across
+stores. ``memory import`` is the explicit, human-reviewed landing: without
+``--yes`` it is a dry-run summary of what would land and nothing is
+written; with ``--yes`` the reviewed records enter the destination as new
+candidates — provenance verbatim, confidence clock re-anchored to the
+destination (destination-clock decay stamping), source evidence left in
+its own trail, the landing recorded in the audit trail referencing the
+source by qualified id only. Both commands inject store paths through the
+federation registry (``--store`` names the scope, ``--root`` supplies the
+path); malformed or conflicting bundles are refused all-or-nothing.
 """
 
 from __future__ import annotations
@@ -102,7 +115,16 @@ from evogine.config import (
     starter_config_yaml,
 )
 from evogine.console.launch import ConsoleError
+from evogine.engine.federation import FederationError, FederationRegistry
 from evogine.engine.store import Engine, StoreError
+from evogine.engine.transfer import (
+    ImportRefused,
+    apply_import,
+    export_bundle,
+    import_preview,
+    read_bundle,
+    write_bundle,
+)
 from evogine.gates.approvals import (
     ApprovalError,
     ApprovalLog,
@@ -365,6 +387,50 @@ def main(argv: list[str] | None = None) -> int:
         help="write the full DAG as JSON to this path, or - for stdout",
     )
 
+    # --- cross-project memory import/export (V4 federation) -----------------
+    # Appended as its own section so parallel CLI registrations merge cleanly.
+    # Store paths are injected through the federation registry at invocation
+    # time (--root is handed to register()); no shared config module is read.
+    memory_parser = subparsers.add_parser(
+        "memory",
+        help="cross-project memory import/export over per-project stores (V4 federation)",
+    )
+    memory_subparsers = memory_parser.add_subparsers(dest="memory_command", required=True)
+    memory_export_parser = memory_subparsers.add_parser(
+        "export",
+        help="write an export bundle of this store's promoted pool (manifest + verbatim payloads)",
+    )
+    memory_export_parser.add_argument(
+        "--store", required=True, help="store identity to export (registry name, e.g. alpha)"
+    )
+    memory_export_parser.add_argument(
+        "--root",
+        required=True,
+        help="engine store root backing --store (injected via the registry)",
+    )
+    memory_export_parser.add_argument("--out", required=True, help="bundle destination path")
+    memory_import_parser = memory_subparsers.add_parser(
+        "import",
+        help="import a bundle as reviewed candidates — dry-run by default; --yes applies",
+    )
+    memory_import_parser.add_argument(
+        "--store", required=True, help="destination store identity (registry name, e.g. beta)"
+    )
+    memory_import_parser.add_argument(
+        "--root",
+        required=True,
+        help="engine store root backing --store (injected via the registry)",
+    )
+    memory_import_parser.add_argument(
+        "--bundle", required=True, help="path to the export bundle to review"
+    )
+    memory_import_parser.add_argument(
+        "--yes",
+        action="store_true",
+        dest="confirmed",
+        help="confirm the reviewed import; without it nothing is ever written",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "run":
         return _run(args.root, repeats=args.repeats)
@@ -412,6 +478,12 @@ def main(argv: list[str] | None = None) -> int:
         return _doctor(config_path=args.config_path)
     if args.command == "decompose":
         return _decompose(args.repo, json_out=args.json_out)
+    if args.command == "memory" and args.memory_command == "export":
+        return _memory_export(args.store, args.root, out=args.out)
+    if args.command == "memory" and args.memory_command == "import":
+        return _memory_import(
+            args.store, args.root, bundle_path=args.bundle, confirmed=args.confirmed
+        )
     return 0  # unreachable: subcommands are required
 
 
@@ -1261,4 +1333,79 @@ def _decompose(repo: str, *, json_out: str | None) -> int:
         out_path.write_text(payload + "\n", encoding="utf-8")
     except OSError as exc:
         return _refuse(f"cannot write --json output to {json_out}: {exc}")
+    return 0
+
+
+# --- cross-project memory import/export (V4 federation) ---------------------
+
+
+def _registered_store(store: str, root: str) -> Engine:
+    """Build the engine for ``store`` with its path injected via the registry.
+
+    The federation registry is the only path-injection abstraction: the CLI
+    hands the operator's ``--root`` to ``register()`` and works through the
+    engine it returns — no shared config module is read or written.
+    """
+    return FederationRegistry().register(store, Path(root))
+
+
+def _memory_export(store: str, root: str, *, out: str) -> int:
+    """Write the export bundle for ``store``'s promoted pool; a pure read."""
+    try:
+        engine = _registered_store(store, root)
+        bundle = export_bundle(engine)
+        written = write_bundle(bundle, Path(out))
+    except (FederationError, StoreError) as exc:
+        return _refuse(str(exc))
+    print(
+        f"exported {len(bundle.manifest.records)} promoted record(s) "
+        f"from {bundle.manifest.source_store} — provenance verbatim, lineage qualified"
+    )
+    print(f"  bundle: {written}")
+    return 0
+
+
+def _memory_import(store: str, root: str, *, bundle_path: str, confirmed: bool) -> int:
+    """Review an export bundle against ``store``; land it only when confirmed.
+
+    Without ``--yes`` this is the dry-run the human reviews: what would
+    land, nothing written. A refused or conflicting bundle exits non-zero
+    with the refusal state on stderr — nothing is ever partially applied.
+    """
+    try:
+        engine = _registered_store(store, root)
+    except (FederationError, StoreError) as exc:
+        return _refuse(str(exc))
+    try:
+        bundle = read_bundle(Path(bundle_path))
+        preview = import_preview(bundle, engine)
+        if not confirmed:
+            print(
+                f"dry run — {len(preview.landings)} record(s) would land in "
+                f"{engine.store_name} as new candidates (nothing written):"
+            )
+            for landing in preview.landings:
+                print(
+                    f"  {landing.qualified_id} -> {landing.record_id} "
+                    f'[{landing.type}] "{landing.title}" confidence {landing.confidence:.2f}'
+                )
+            print(
+                "  on apply: provenance verbatim, confidence clock re-anchored "
+                "to this store, source evidence left in its own trail"
+            )
+            print("re-run with --yes to apply the reviewed import")
+            return 0
+        landed = apply_import(bundle, engine)
+    except ImportRefused as exc:
+        return _refuse(str(exc))
+    except StoreError as exc:
+        # Outside the refusal vocabulary: a contract violation mid-apply
+        # (e.g. a concurrent writer broke the one-writer-per-root rule).
+        return _refuse(f"import failed after landing began — {exc}")
+    for record in landed:
+        print(f"imported {record.id} as candidate in {engine.store_name}")
+    print(
+        f"import complete: {len(landed)} record(s) landed, provenance verbatim, "
+        "recorded in the audit trail"
+    )
     return 0

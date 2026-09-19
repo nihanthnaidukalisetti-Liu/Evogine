@@ -150,7 +150,15 @@ class AuditEvent(BaseModel):
     seq: int = 0
     ts: datetime = Field(default_factory=_now)
     event: Literal[
-        "propose", "queue_replay", "promote", "demote", "merge", "decay", "retire", "reinstate"
+        "propose",
+        "queue_replay",
+        "promote",
+        "demote",
+        "merge",
+        "decay",
+        "retire",
+        "reinstate",
+        "import",
     ]
     record_id: str
     from_status: str | None = None
@@ -619,6 +627,96 @@ class Engine:
         )
         self._commit(f"reinstate: {learning_id}")
         return restored
+
+    # --------------------------------------------------- v4: import (cross-scope)
+
+    def import_candidate(
+        self,
+        record: LearningRecord,
+        *,
+        source_ref: str,
+        now: datetime | None = None,
+    ) -> LearningRecord:
+        """Land a cross-scope imported record as a new ``candidate`` (V4).
+
+        The one write path that may move a row into a local pool from
+        outside it — called only from the explicit, human-confirmed import
+        flow (:mod:`evogine.engine.transfer`), never by retrieval-adjacent
+        code, so promotion-only per scope (governance §3.2) survives: the
+        record's status here is ``candidate``, and only this store's own
+        gate and approval boundary can ever promote it. The source's
+        replay evidence is scope-bound and is not carried in as if it were
+        this store's pending evidence — the landed record's counterfactual
+        is blank (``promote`` re-checks its own invariants on whatever this
+        store queues), while the evidence itself stays in the source trail,
+        referenced by ``source_ref``.
+
+        Destination-clock decay stamping: ``confidence_updated_at`` is
+        stamped to ``now`` (this store's clock), so the destination's first
+        decay pass anchors at the import moment instead of re-aging the
+        belief across the source's timeline — the destination takes the
+        confidence value as of import and starts its own clock there.
+
+        ``source_ref`` is the qualified source id ``<store>:<record-id>`` —
+        the only cross-store reference the audit trail records (§3.3/§3.4):
+        no source sequence numbers, no stitched global order. Refuses
+        fail-closed: qualified source refs, unqualified local id free of
+        collisions here, provenance-bearing payload in the exporter's
+        ``promoted`` shape, and cross-references that survive this store's
+        write-time validation. Refusals persist nothing.
+        """
+        if record.status != "promoted":
+            raise StoreError(
+                f"import_candidate lands exported (promoted) records; {record.id} is "
+                f"{record.status}"
+            )
+        if record.merged_into is not None or record.retired_at is not None:
+            raise StoreError(
+                f"import_candidate refuses lifecycle stamps from another store: {record.id} "
+                "carries merged/retired state — export bundles carry live promoted rows only"
+            )
+        if ":" in record.id:
+            raise StoreError(
+                f"record id {record.id!r} is qualified; a store's own record ids are "
+                "unqualified — the <store-name>:<record-id> form is reserved for "
+                "cross-scope references"
+            )
+        if not _ID_PATTERN.fullmatch(record.id):
+            raise StoreError(f"record id {record.id!r} must match {_ID_PATTERN.pattern}")
+        source_store, source_record_id = split_qualified_id(source_ref)
+        if source_store == self.store_name:
+            raise StoreError(
+                f"source_ref {source_ref!r} names this store ({self.store_name}); an import "
+                "event references another store's trail, never this one"
+            )
+        if source_record_id != record.id:
+            raise StoreError(f"source_ref {source_ref!r} does not name this record ({record.id})")
+        if self._record_path(record.id).exists():
+            raise StoreError(f"record already exists: {record.id}")
+        self._validate_cross_references(record)
+        moment = now if now is not None else _now()
+        landed = record.model_copy(
+            update={
+                "status": "candidate",
+                "counterfactual": RecordCounterfactual(),
+                "promoted_at": None,
+                "confidence_updated_at": moment,
+            }
+        )
+        self._save(landed)
+        self._append_audit(
+            AuditEvent(
+                event="import",
+                record_id=landed.id,
+                to_status="candidate",
+                reason=(
+                    f"imported from {source_ref} — provenance verbatim; confidence "
+                    f"clock re-anchored to this store's clock at {moment.isoformat()}"
+                ),
+            )
+        )
+        self._commit(f"import: {landed.id} from {source_ref}")
+        return landed
 
     # ----------------------------------------------------------- persistence
 

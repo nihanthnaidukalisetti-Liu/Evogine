@@ -38,6 +38,15 @@ contaminated or over-ceiling run is refused before anything is evaluated —
 exiting non-zero with $0 spent. Both operate on an explicit ``--root``:
 they create or read a store, and silently defaulting to the working
 directory could benchmark or mutate the wrong store (git-safety).
+
+``init`` (V4 productization) is the first-run wizard: it creates the
+learning store, writes the starter ``evogine.yaml`` — refusing to
+overwrite an existing config — and reports the provider key's state,
+read from the environment by name and never echoed or stored.
+``doctor`` renders environment readiness — config, git, Docker,
+provider key, disk, sync endpoints — with every state explicit (ok /
+warn / fail, each with its fix where one exists), exiting non-zero only
+when a check fails.
 """
 
 from __future__ import annotations
@@ -45,10 +54,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
+import subprocess
 import sys
+from enum import Enum
 from pathlib import Path
+from urllib.error import HTTPError
+from urllib.request import urlopen
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from evogine import __version__
 from evogine.bench.budgets import (
@@ -80,6 +94,13 @@ from evogine.bench.replay import ReplaySchedule, build_replay_requests
 from evogine.bench.rundirs import RunCompleteError, open_run
 from evogine.bench.runner import KnowledgeRunner
 from evogine.bench.shadow import ShadowRefusalError, load_shadow_candidate, run_shadow_pass
+from evogine.config import (
+    ConfigError,
+    SyncEndpoint,
+    default_config_path,
+    load_config,
+    starter_config_yaml,
+)
 from evogine.console.launch import ConsoleError
 from evogine.engine.store import Engine, StoreError
 from evogine.gates.approvals import (
@@ -293,6 +314,35 @@ def main(argv: list[str] | None = None) -> int:
         "--port", type=int, default=8765, help="bind port (default: 8765)"
     )
 
+    # --- onboarding & config (V4 productization) ---------------------------
+    # Appended as its own section so parallel CLI registrations merge cleanly.
+    init_parser = subparsers.add_parser(
+        "init",
+        help="first-run setup: create the learning store, write the starter config, check the provider key",
+    )
+    init_parser.add_argument(
+        "--root",
+        default=".evogine/store",
+        help="learning store root to create (default: .evogine/store); recorded in the written config",
+    )
+    init_parser.add_argument(
+        "--config",
+        default=None,
+        dest="config_path",
+        help="config file to write (default: ./evogine.yaml); an existing one is never overwritten",
+    )
+
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help="environment readiness: config, git, Docker, provider key, disk, sync endpoints",
+    )
+    doctor_parser.add_argument(
+        "--config",
+        default=None,
+        dest="config_path",
+        help="config file to read (default: ./evogine.yaml); a missing config is a warning, not an error",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "run":
         return _run(args.root, repeats=args.repeats)
@@ -334,6 +384,10 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.command == "console":
         return _console(args.root, args.operator, host=args.host, port=args.port)
+    if args.command == "init":
+        return _init(args.root, config_path=args.config_path)
+    if args.command == "doctor":
+        return _doctor(config_path=args.config_path)
     return 0  # unreachable: subcommands are required
 
 
@@ -824,4 +878,330 @@ def _approvals_decide(
         print(f"error: {exc}", file=sys.stderr)
         return 1
     print(f"{proposal_id} {action}: record {record.id} is {record.status}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Onboarding & config (V4 productization): init, doctor, and their checks.
+# Every state is explicit — ok / warn / fail plus the fix — the house style
+# the gates set, inherited not reinvented.
+# ---------------------------------------------------------------------------
+
+
+class CheckState(str, Enum):
+    """A doctor check's verdict: ok, warn (usable, with a catch), or fail."""
+
+    OK = "ok"
+    WARN = "warn"
+    FAIL = "fail"
+
+
+class CheckResult(BaseModel):
+    """One doctor check's outcome: the state, what was found, and the fix."""
+
+    model_config = ConfigDict(frozen=True)
+
+    check: str
+    state: CheckState
+    detail: str
+    fix: str | None = None
+
+
+_GIB = 1024**3
+_WARN_DISK_GIB = 5.0
+_FAIL_DISK_GIB = 1.0
+_SYNC_PROBE_TIMEOUT_SECONDS = 2.0
+
+
+def _check_git() -> CheckResult:
+    """git is the store's substrate: a missing executable fails, hard."""
+    fix = (
+        "install git (https://git-scm.com) — the learning store is a git "
+        "repository; nothing runs without it"
+    )
+    try:
+        proc = subprocess.run(
+            ["git", "--version"], capture_output=True, text=True, check=False
+        )
+    except OSError as exc:  # FileNotFoundError: no git on PATH
+        return CheckResult(
+            check="git",
+            state=CheckState.FAIL,
+            detail=f"the git executable was not found: {exc}",
+            fix=fix,
+        )
+    if proc.returncode != 0:
+        return CheckResult(
+            check="git",
+            state=CheckState.FAIL,
+            detail=f"git --version exited {proc.returncode}: {proc.stderr.strip()}",
+            fix=fix,
+        )
+    return CheckResult(check="git", state=CheckState.OK, detail=proc.stdout.strip())
+
+
+def _check_docker() -> CheckResult:
+    """Probe Docker the way the code gate does: never raises, every state named.
+
+    The docker-py import is lazy, so the client being absent (the core
+    install) and the daemon being down are distinct failures with distinct
+    fixes — neither is silently collapsed into "docker missing".
+    """
+    try:
+        import docker  # type: ignore[import-untyped]
+    except Exception as exc:  # noqa: BLE001 — any import failure means "not installed"
+        return CheckResult(
+            check="docker",
+            state=CheckState.FAIL,
+            detail=f"the docker python client is not installed ({exc})",
+            fix=(
+                "pip install 'evogine[docker]' — the code gate runs candidate "
+                "patches inside a Docker sandbox"
+            ),
+        )
+    try:
+        docker.from_env().ping()
+    except Exception as exc:  # noqa: BLE001 — a probe, never a raise (DockerSandbox.available's contract)
+        return CheckResult(
+            check="docker",
+            state=CheckState.FAIL,
+            detail=f"no usable Docker daemon: {exc}",
+            fix="start the Docker daemon — the code gate refuses (fails closed) without it",
+        )
+    return CheckResult(check="docker", state=CheckState.OK, detail="daemon reachable")
+
+
+def _check_provider_key(api_key_env: str | None) -> CheckResult:
+    """Key presence by name, from the environment; the value is never shown."""
+    env_name = api_key_env if api_key_env is not None else "ANTHROPIC_API_KEY"
+    if os.environ.get(env_name, "").strip():
+        return CheckResult(
+            check="provider",
+            state=CheckState.OK,
+            detail=(
+                f"{env_name} is set in the environment (the value is never "
+                "printed, logged, or written to disk)"
+            ),
+        )
+    return CheckResult(
+        check="provider",
+        state=CheckState.WARN,
+        detail=(
+            f"{env_name} is not set — offline work proceeds, but live runs "
+            "refuse before spending until a key is configured"
+        ),
+        fix=(
+            f"export {env_name}=<your provider key> — read from the environment "
+            "at run time, never stored in the config"
+        ),
+    )
+
+
+def _disk_verdict(free_bytes: int, path: Path) -> tuple[CheckState, str, str | None]:
+    """Pure disk thresholds: under 1 GiB free fails, under 5 GiB warns."""
+    free_gib = free_bytes / _GIB
+    readable = f"{free_gib:.1f} GiB free on {path}"
+    if free_gib < _FAIL_DISK_GIB:
+        return (
+            CheckState.FAIL,
+            f"only {readable}",
+            "free disk space — the store, run dirs, and gate images need room to grow",
+        )
+    if free_gib < _WARN_DISK_GIB:
+        return (
+            CheckState.WARN,
+            f"only {readable}",
+            "free disk space before a long run — run dirs and gate images accumulate",
+        )
+    return CheckState.OK, readable, None
+
+
+def _nearest_existing(path: Path) -> Path:
+    """The deepest ancestor of ``path`` that exists (the path itself counts).
+
+    A configured store root may not exist yet; its filesystem is still
+    measurable at the nearest existing ancestor — and the report says which
+    path was measured.
+    """
+    probe = path
+    while not probe.exists():
+        parent = probe.parent
+        if parent == probe:
+            break
+        probe = parent
+    return probe
+
+
+def _check_disk(root: Path) -> CheckResult:
+    try:
+        usage = shutil.disk_usage(_nearest_existing(root))
+    except OSError as exc:
+        return CheckResult(
+            check="disk",
+            state=CheckState.FAIL,
+            detail=f"could not measure free space near {root}: {exc}",
+        )
+    state, detail, fix = _disk_verdict(usage.free, root)
+    return CheckResult(check="disk", state=state, detail=detail, fix=fix)
+
+
+def _check_sync_endpoint(endpoint: SyncEndpoint) -> CheckResult:
+    """Probe one configured sync endpoint; unreachable fails with the fix."""
+    url = str(endpoint.url)
+    try:
+        with urlopen(url, timeout=_SYNC_PROBE_TIMEOUT_SECONDS) as response:
+            status = response.status
+    except HTTPError as exc:
+        return CheckResult(
+            check="sync",
+            state=CheckState.FAIL,
+            detail=f"endpoint {endpoint.name!r} answered HTTP {exc.code} at {url}",
+            fix=(
+                "the daemon is answering but this path is wrong — correct the "
+                "endpoint URL in the config"
+            ),
+        )
+    except OSError as exc:  # URLError, ConnectionRefusedError, timeouts — all OSError
+        return CheckResult(
+            check="sync",
+            state=CheckState.FAIL,
+            detail=f"endpoint {endpoint.name!r} unreachable at {url}: {exc}",
+            fix="start the sync daemon, or correct the endpoint URL in the config",
+        )
+    return CheckResult(
+        check="sync",
+        state=CheckState.OK,
+        detail=f"endpoint {endpoint.name!r} answered (HTTP {status}) at {url}",
+    )
+
+
+def _init(root: str, *, config_path: str | None) -> int:
+    """First-run setup: store, starter config, provider key walkthrough.
+
+    Refusal-first ordering: an existing config file refuses before anything
+    is created — init never overwrites. A pre-existing store is fine (init
+    is idempotent there) and is reported as such, with its record count.
+    """
+    cfg_path = Path(config_path) if config_path is not None else default_config_path()
+    if cfg_path.exists():
+        return _refuse(
+            f"config {cfg_path} already exists — refusing to overwrite it "
+            "(remove it by hand or pass --config to write elsewhere); nothing was created"
+        )
+    store_root = Path(root)
+    store_existed = (store_root / ".git").exists()
+    try:
+        engine = Engine(store_root)
+    except (OSError, StoreError) as exc:
+        return _refuse(f"could not create the learning store at {store_root}: {exc}")
+    record_count = len(list(engine.records_dir.glob("*.json")))
+    try:
+        cfg_path.write_text(starter_config_yaml(str(store_root)), encoding="utf-8")
+    except OSError as exc:
+        # Partial init is reported, never hidden: the store exists and is
+        # usable; only the config write failed.
+        return _refuse(
+            f"the learning store is ready at {store_root}, but writing the config "
+            f"failed: {exc} — create {cfg_path} by hand, then run 'evogine doctor'"
+        )
+    print("evogine init")
+    state = "already present" if store_existed else "created"
+    print(f"  store:  {state} at {store_root} ({record_count} record(s))")
+    print(f"  config: wrote {cfg_path} (default profile: default)")
+    # Load back what was just written: the starter config is itself subject
+    # to the loader's contract, and a failure here is a bug that says so
+    # loudly instead of printing a walkthrough from the wrong schema.
+    try:
+        profile = load_config(cfg_path).profile()
+    except ConfigError as exc:
+        return _refuse(
+            f"the config just written does not load ({exc}) — this is a bug, please report it"
+        )
+    key_env = profile.provider.api_key_env
+    if os.environ.get(key_env, "").strip():
+        print(
+            f"  provider key: {key_env} is set in the environment "
+            "(the value is never printed or stored)"
+        )
+    else:
+        print(f"  provider key: {key_env} is not set — live runs refuse until it is configured")
+        print(f"    fix: export {key_env}=<your provider key>")
+        print(
+            "         the key is read from the environment at run time; "
+            "it is never written to the config or any file"
+        )
+    print("next: evogine doctor   # verify the environment end-to-end")
+    return 0
+
+
+def _doctor(*, config_path: str | None) -> int:
+    """Environment readiness: every state explicit; exit 1 only on a failure.
+
+    A missing config warns (environment defaults apply) rather than failing:
+    offline work proceeds without one. Warnings never fail the run; a fail
+    means the environment cannot do its job, and the fix is printed.
+    """
+    print("evogine doctor — environment readiness")
+    results: list[CheckResult] = []
+    learning_root: Path | None = None
+    api_key_env: str | None = None
+    endpoints: list[SyncEndpoint] = []
+    cfg_path = Path(config_path) if config_path is not None else default_config_path()
+    if cfg_path.is_file():
+        try:
+            config = load_config(cfg_path)
+            profile = config.profile()
+            learning_root = profile.store.learning_root
+            api_key_env = profile.provider.api_key_env
+            endpoints = list(profile.sync.endpoints)
+            results.append(
+                CheckResult(
+                    check="config",
+                    state=CheckState.OK,
+                    detail=f"{cfg_path} (profile: {config.default_profile})",
+                )
+            )
+        except ConfigError as exc:
+            results.append(
+                CheckResult(
+                    check="config",
+                    state=CheckState.FAIL,
+                    detail=str(exc),
+                    fix="correct the config file by hand, or remove it and re-run 'evogine init'",
+                )
+            )
+    else:
+        results.append(
+            CheckResult(
+                check="config",
+                state=CheckState.WARN,
+                detail=f"no config file at {cfg_path} — environment defaults apply",
+                fix="run 'evogine init' to create the store and write one",
+            )
+        )
+    results.append(_check_git())
+    results.append(_check_docker())
+    results.append(_check_provider_key(api_key_env))
+    results.append(_check_disk(learning_root if learning_root is not None else Path.cwd()))
+    if endpoints:
+        results.extend(_check_sync_endpoint(endpoint) for endpoint in endpoints)
+    else:
+        results.append(
+            CheckResult(
+                check="sync",
+                state=CheckState.OK,
+                detail="no sync endpoints configured (nothing to probe)",
+            )
+        )
+    for result in results:
+        print(f"  {result.check:<8} {result.state.value:<5} {result.detail}")
+        if result.fix is not None:
+            print(f"           fix: {result.fix}")
+    ok = sum(1 for result in results if result.state is CheckState.OK)
+    warns = sum(1 for result in results if result.state is CheckState.WARN)
+    fails = sum(1 for result in results if result.state is CheckState.FAIL)
+    if fails:
+        print(f"doctor: not ready — {fails} failure(s), {warns} warning(s), {ok} ok")
+        return 1
+    print(f"doctor: ready ({ok} ok, {warns} warning(s))")
     return 0

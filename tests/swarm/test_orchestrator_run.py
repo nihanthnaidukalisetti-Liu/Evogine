@@ -18,6 +18,7 @@ from pathlib import Path
 from orchestrator_helpers import (
     FakeModelClient,
     FakeSink,
+    call_bounded,
     make_plan,
     make_settings,
 )
@@ -268,6 +269,76 @@ def test_killed_run_resumes_from_last_checkpoint_without_duplicate_spend(
     assert any(event.type == "status" and event.status == "skipped" for event in all_events)
     # Money never double counts: spend resumes from the checkpoint sum.
     assert resumed.spent_usd == CALL_COST * 4
+
+
+def test_cyclic_plan_across_repeated_resumes_never_livelocks_or_double_bills(
+    tmp_path: Path,
+) -> None:
+    """D1 across the resume seam: break-cycle work stays bounded and honest.
+
+    A two-cycle plan under a ceiling that fits exactly two calls: the first
+    attempt resolves one cycle, then refuses fail-closed; a re-run under
+    the same tight ceiling refuses again with zero progress and zero spend;
+    the final attempt under a roomy ceiling designates a fresh breaker,
+    resolves the second cycle, and completes. Every attempt is bounded by
+    the hard join in :func:`call_bounded` — the pre-fix pool wedged on the
+    first attempt's second stuck event (a stale breaker designation), and
+    only a kill could end it. No item is ever re-billed across resumes.
+    """
+    plan = make_plan(
+        4,
+        dependencies={"m0": ["m1"], "m1": ["m0"], "m2": ["m3"], "m3": ["m2"]},
+    )
+    tight = make_settings(min_workers=1, max_workers=1, ceiling_usd=TIGHT_CEILING)
+
+    first_client = FakeModelClient()
+    first = call_bounded(
+        lambda: _orchestrator(first_client, FakeSink(), tight).run(plan, tmp_path)
+    )
+    assert first.outcome == "refused"
+    assert first.items_succeeded == 2  # the first cycle resolved
+    assert first.items_failed == 1  # the refused item is a visible failure
+    assert len(first_client.requests) == 2
+
+    run = open_run(tmp_path, first.run_id)
+    assert not run.is_complete()  # a refusal stays resumable
+    done = CheckpointStore(run).completed()
+    assert set(done) == {"m0", "m1"}
+
+    # Same tight ceiling: the re-run refuses again — promptly (bounded),
+    # with no progress and no new spend. It must never wedge or re-bill.
+    second_client = FakeModelClient()
+    second = call_bounded(
+        lambda: _orchestrator(second_client, FakeSink(), tight).run(
+            plan, tmp_path, resume_run_id=first.run_id
+        )
+    )
+    assert second.outcome == "refused"
+    assert second.items_succeeded == 2  # the resumed checkpoints, not new work
+    assert second.resumed_items == 2
+    assert second.items_failed == 1  # m2 refused again, still unmarked
+    assert second_client.requests == []  # zero new model calls: nothing re-billed
+    assert second.spent_usd == CALL_COST * 2
+    assert set(CheckpointStore(RunDirectory(tmp_path, second.run_id)).completed()) == {
+        "m0",
+        "m1",
+    }
+
+    # A roomy ceiling lets the fresh breaker designation resolve the last
+    # cycle: exactly the two unfinished items run, spend is exact.
+    roomy = make_settings(min_workers=1, max_workers=1, ceiling_usd="10.00")
+    third_client = FakeModelClient()
+    third = call_bounded(
+        lambda: _orchestrator(third_client, FakeSink(), roomy).run(
+            plan, tmp_path, resume_run_id=first.run_id
+        )
+    )
+    assert third.outcome == "completed"
+    assert third.resumed_items == 2
+    assert third.items_succeeded == 4
+    assert len(third_client.requests) == 2  # m0/m1 were never re-executed
+    assert third.spent_usd == CALL_COST * 4
+    assert RunDirectory(tmp_path, third.run_id).is_complete()
 
 
 def test_events_are_valid_jsonl_with_string_money(tmp_path: Path) -> None:

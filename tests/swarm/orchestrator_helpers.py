@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Sequence
+import threading
+from collections.abc import Callable, Sequence
 from decimal import Decimal
 
 from evogine.swarm.clients import ModelClientError, ModelRequest, ModelResponse
@@ -116,6 +117,34 @@ class CrashingModelClient(FakeModelClient):
         return super().complete(request)
 
 
+def call_bounded[T](fn: Callable[[], T], *, timeout: float = 30.0) -> T:
+    """Run ``fn`` on a watcher thread with a hard join timeout.
+
+    A wedged pool parks its workers in ``cond.wait`` and never returns;
+    the bounded join turns that wedge into an assertion failure with a
+    name, not a hung suite. Daemon threads let pytest exit after the
+    failure — a deadlock repro must be able to fail.
+    """
+    outcome: list[T] = []
+    error: list[Exception] = []
+
+    def target() -> None:
+        try:
+            outcome.append(fn())
+        except Exception as exc:  # noqa: BLE001 - the watcher re-raises it below, nothing is swallowed
+            error.append(exc)
+
+    runner = threading.Thread(target=target, name="bounded-call-runner", daemon=True)
+    runner.start()
+    runner.join(timeout=timeout)
+    if error:
+        raise error[0]
+    assert not runner.is_alive(), (
+        f"call did not return within {timeout}s — the pool wedged"
+    )
+    return outcome[0]
+
+
 def make_dag(spec: dict[str, dict[str, object]]) -> DecompositionDAG:
     """A DecompositionDAG from ``{module_id: {kind, imports, tested_by, loc, criticality}}``."""
     modules = [
@@ -194,6 +223,7 @@ __all__ = [
     "CrashingModelClient",
     "FakeModelClient",
     "FakeSink",
+    "call_bounded",
     "make_dag",
     "make_plan",
     "make_settings",

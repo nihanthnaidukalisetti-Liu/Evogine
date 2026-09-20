@@ -57,7 +57,7 @@ unattended promotion remain out of scope by design.
 - Console knowledge-injection panel over the reviewed-manifest import flow —
   manifest summaries before any action, refusals as visible panels, and one
   guarded confirm landing candidates — plus the stores-and-sync selector for
-  read-only views over the local store and configured sync remotes.
+  read-only views over the local store and configured sync remotes (#37).
 
 **Sync and onboarding (V4)**
 

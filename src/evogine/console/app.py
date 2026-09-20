@@ -18,7 +18,7 @@ trusted as HTML — and no client framework is loaded.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -28,11 +28,21 @@ from fastapi.templating import Jinja2Templates
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import Response
 
+from evogine.config import SyncEndpoint
 from evogine.console import views
 from evogine.console.funnel import funnel_routes
+from evogine.console.injection import injection_routes, resolve_imports_dir
 from evogine.console.launch import ConsoleError, validate_operator
+from evogine.console.sources import (
+    LOCAL_SOURCE_NAME,
+    build_remote_overview,
+    resolve_source,
+    sources_bar,
+    sources_routes,
+)
 from evogine.console.swarm import resolve_swarm_runs_root, swarm_routes
 from evogine.console.write import register_write_routes
+from evogine.sync.client import SyncClientError
 
 _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 
@@ -41,6 +51,8 @@ def create_app(
     root: Path | str,
     operator: str,
     swarm_runs_root: Path | str | None = None,
+    imports_dir: Path | str | None = None,
+    sync_endpoints: Sequence[SyncEndpoint] | None = None,
 ) -> FastAPI:
     """Build the console for one store root and operator identity.
 
@@ -49,11 +61,17 @@ def create_app(
     operator always knows which store they are looking at. The swarm board
     reads run directories under ``swarm_runs_root`` when given, else the
     derived default under the store root (the config's ``swarm.runs_dir``
-    location).
+    location). The knowledge-injection panel reads export bundles under
+    ``imports_dir`` when given, else the derived default under the store
+    root. The stores-and-sync selector reads the given sync endpoints
+    (launch-time config) — remote sources are read-only; every write path
+    stays bound to the local store.
     """
     identity = validate_operator(operator)
     store_root = Path(root)
     runs_root = resolve_swarm_runs_root(store_root, swarm_runs_root)
+    bundles_dir = resolve_imports_dir(store_root, imports_dir)
+    endpoints = tuple(sync_endpoints) if sync_endpoints else ()
     app = FastAPI(title="Evogine Console", docs_url=None, redoc_url=None, openapi_url=None)
     templates = Jinja2Templates(
         env=jinja2.Environment(
@@ -100,8 +118,39 @@ def create_app(
 
     @app.get("/")
     def overview(request: Request) -> Response:
+        """The local overview — or a remote source's, via the selector.
+
+        The selector only ever changes what this page *reads* (the local
+        files, or a remote's query API through the sync client); an unknown
+        source name is refused with what is configured, and a remote that
+        will not answer is refused with the client's reason. Neither error
+        can fall back to local reads silently.
+        """
+        source = request.query_params.get("source")
+        if source not in (None, "", LOCAL_SOURCE_NAME):
+            try:
+                remote = resolve_source(source, endpoints)
+            except ConsoleError as exc:
+                return refusal(request, 400, str(exc))
+            assert remote is not None  # a named source resolves to a remote
+            try:
+                view = build_remote_overview(remote)
+            except SyncClientError as exc:
+                return refusal(request, 503, str(exc))
+            return render(
+                request,
+                "overview.html",
+                {"remote": view, "sources_bar": sources_bar(source, endpoints, base="/")},
+            )
         return page(
-            request, lambda: {"counts": views.build_overview(store_root)}, "overview.html"
+            request,
+            lambda: {
+                "counts": views.build_overview(store_root),
+                "sources_bar": sources_bar(LOCAL_SOURCE_NAME, endpoints, base="/")
+                if endpoints
+                else [],
+            },
+            "overview.html",
         )
 
     @app.get("/decisions")
@@ -134,6 +183,8 @@ def create_app(
 
     app.include_router(funnel_routes(store_root, render))
     app.include_router(swarm_routes(store_root, runs_root, render))
+    app.include_router(injection_routes(store_root, bundles_dir, render, refuse=refusal))
+    app.include_router(sources_routes(store_root, endpoints, render))
 
     # The write path is its own module so the read-only surface stays a
     # separate, reviewable change; registration is the only seam.

@@ -14,6 +14,8 @@ import socket
 from pathlib import Path
 from typing import cast
 
+from evogine.config import ConfigError, SyncEndpoint, load_config
+
 
 class ConsoleError(Exception):
     """A console launch or view request violates the console contract.
@@ -93,3 +95,23 @@ def resolve_bind_host(host: str) -> str:
     # Deterministic pick: IPv4 sorts before IPv6 lexically, and every resolved
     # address is loopback by the check above.
     return min(addresses)
+
+
+def load_sync_endpoints(config_path: str | None) -> tuple[SyncEndpoint, ...]:
+    """The sync endpoints the stores-and-sync selector reads, from the config.
+
+    Reads the config's *default profile* — the same profile ``evogine sync
+    status`` reports on — so the selector's source list is the fleet the
+    sync CLI already sees. ``None`` (no ``--config``) means no remotes: the
+    selector then shows the local store alone. A config that refuses to
+    load refuses the launch — ``--config`` is an explicit operator act, and
+    launching with a broken config and silently no remotes would render
+    the panel confidently empty instead of honestly refusing.
+    """
+    if config_path is None:
+        return ()
+    try:
+        config = load_config(config_path)
+    except ConfigError as exc:
+        raise ConsoleError(f"sync config {config_path} is unusable: {exc}") from exc
+    return tuple(config.profile().sync.endpoints)

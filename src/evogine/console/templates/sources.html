@@ -53,7 +53,10 @@
 {% if not remotes_configured %}
 <p class="empty">
   No sync remotes configured — add endpoints under <code>profiles.&lt;name&gt;.sync.endpoints</code>
-  in a config file and relaunch with <code>--config</code> to read them here.
+  in a config file and relaunch the console with that config:
+  <code>python -m evogine.console.server --root &lt;root&gt; --operator &lt;identity&gt; --config &lt;file&gt;</code>.
+  The <code>evogine console</code> command itself takes no config flag; launched that way,
+  this selector reads the local store alone.
 </p>
 {% endif %}
 {% endblock %}

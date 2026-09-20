@@ -313,3 +313,8 @@ Three rules are enforced, not conventional:
   before the first write; a refused bundle persists nothing. An export
   of an empty promoted pool is not an error — it exports a manifest with
   zero records.
+
+Cross-machine sync is the other movement path — whole stores between
+machines over the sync daemon, rather than reviewed bundles between
+projects. The [operator runbook](operator-runbook.md#sync-client-commands)
+documents `evogine sync status`/`push`/`pull` with verified output.

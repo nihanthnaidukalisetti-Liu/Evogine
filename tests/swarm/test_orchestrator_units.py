@@ -8,6 +8,7 @@ refusal, sink-only) live in ``test_orchestrator_run.py``.
 from __future__ import annotations
 
 import json
+import tempfile
 import threading
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -17,7 +18,7 @@ from pathlib import Path
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
-from orchestrator_helpers import make_dag, make_plan
+from orchestrator_helpers import call_bounded, make_dag, make_plan
 from pydantic import ValidationError
 
 from evogine.bench.rundirs import RunDirectory, open_run
@@ -43,6 +44,7 @@ from evogine.swarm.orchestrator import (
 )
 from evogine.swarm.orchestrator.checkpoint import marker_name
 from evogine.swarm.orchestrator.planning import TIGHT_FRACTION
+from evogine.swarm.orchestrator.pool import _ReadyQueue
 from evogine.swarm.orchestrator.spend import SpendCeilingRefused
 
 EXAMPLES = 25
@@ -264,6 +266,40 @@ def _scheduler(
     )
 
 
+def _drain(
+    plan: WorkPlan,
+    root: Path,
+    *,
+    max_workers: int,
+    work_fn: Callable[[WorkItem, int], ItemResult],
+) -> dict[str, ItemResult]:
+    """Run the scheduler to settlement under a hard bounded join."""
+    scheduler = _scheduler(
+        plan, root, min_workers=1, max_workers=max_workers, work_fn=work_fn
+    )
+    return call_bounded(lambda: scheduler.run(frozenset()))
+
+
+class _Sequencer:
+    """Lock-serialized start/finish counter for cross-thread order assertions."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._next = 0
+        self.started: dict[str, int] = {}
+        self.finished: dict[str, int] = {}
+
+    def start(self, item_id: str) -> None:
+        with self._lock:
+            self._next += 1
+            self.started[item_id] = self._next
+
+    def finish(self, item_id: str) -> None:
+        with self._lock:
+            self._next += 1
+            self.finished[item_id] = self._next
+
+
 def test_scheduler_spawns_within_bounds_and_finishes_all_items(tmp_path: Path) -> None:
     plan = make_plan(17)
     scheduler = _scheduler(
@@ -342,6 +378,158 @@ def test_scheduler_breaks_import_cycles_liveness_first(tmp_path: Path) -> None:
     )
     results = scheduler.run(frozenset())
     assert set(results) == {"c0", "c1", "c2"}  # liveness: the cycle completed
+
+
+def test_breaker_designation_is_live_until_the_breaker_settles() -> None:
+    """The D1 contract at the queue level: designations retire on settlement.
+
+    A stale entry made every later stuck event return ``None`` — every
+    worker then parked in ``cond.wait`` forever. The second cycle's stuck
+    event here must designate a fresh breaker.
+    """
+    plan = make_plan(
+        4,
+        dependencies={"m0": ["m1"], "m1": ["m0"], "m2": ["m3"], "m3": ["m2"]},
+    )
+    queue = _ReadyQueue(plan, frozenset())
+
+    assert queue.take() is None  # both cycles block: nothing takeable
+    assert queue.break_cycle_if_stuck() == "m0"  # first designation
+    assert queue.break_cycle_if_stuck() is None  # one live designation at a time
+
+    item = queue.take()
+    assert item is not None and item.item_id == "m0"
+    queue.complete("m0", failed=False)
+    assert queue.break_cycle_if_stuck() is None  # m1 is unblocked; not stuck
+
+    other = queue.take()
+    assert other is not None and other.item_id == "m1"
+    queue.complete("m1", failed=False)
+
+    assert queue.take() is None  # the second cycle is stuck ...
+    assert queue.break_cycle_if_stuck() == "m2"  # ... and gets a fresh breaker
+
+
+def test_second_stuck_event_after_a_resolved_breaker_does_not_wedge(tmp_path: Path) -> None:
+    """Deterministic D1 repro: two disjoint cycles on a one-worker pool.
+
+    The pre-fix pool left the first cycle's breaker designated forever, so
+    the second cycle's stuck event returned ``None``, the worker parked in
+    ``cond.wait``, and ``Scheduler.run`` never returned — the dogfood's
+    frozen run. No sleeps and no concurrency beyond one worker: the wedge
+    was a pure state-machine defect. The bounded join in
+    :func:`call_bounded` turns a regression into a failure, not a hang.
+    """
+    plan = make_plan(
+        4,
+        dependencies={"m0": ["m1"], "m1": ["m0"], "m2": ["m3"], "m3": ["m2"]},
+    )
+    scheduler = _scheduler(
+        plan,
+        tmp_path,
+        min_workers=1,
+        max_workers=1,
+        work_fn=_verified_result,
+    )
+    results = call_bounded(lambda: scheduler.run(frozenset()))
+    assert set(results) == {"m0", "m1", "m2", "m3"}
+    assert all(result.outcome == "verified" for result in results.values())
+
+
+@given(
+    count=st.integers(min_value=2, max_value=10),
+    raw_edges=st.lists(
+        st.tuples(st.integers(min_value=0, max_value=9), st.integers(min_value=0, max_value=9)),
+        max_size=20,
+    ),
+    max_workers=st.integers(min_value=1, max_value=4),
+)
+@settings(max_examples=EXAMPLES)
+def test_property_acyclic_plans_drain_strictly_in_dependency_order(
+    count: int,
+    raw_edges: list[tuple[int, int]],
+    max_workers: int,
+) -> None:
+    """Dependent, cycle-free plans always drain — strictly dependency-ordered.
+
+    Edges point at strictly earlier items (acyclic by construction); every
+    item must start only after each of its dependencies finished. This is
+    the coverage gap that let D1 through: the suite never built a plan
+    whose breaker had to resolve.
+    """
+    edges = {(i, j) for i, j in raw_edges if j < i < count}
+    dependencies: dict[str, list[str]] = {f"m{index}": [] for index in range(count)}
+    for i, j in sorted(edges):
+        dependencies[f"m{i}"].append(f"m{j}")
+    plan = make_plan(count, dependencies=dependencies)
+    seq = _Sequencer()
+
+    def work(item: WorkItem, worker_id: int) -> ItemResult:
+        seq.start(item.item_id)
+        seq.finish(item.item_id)
+        return _verified_result(item, worker_id)
+
+    with tempfile.TemporaryDirectory() as root:
+        results = _drain(plan, Path(root), max_workers=max_workers, work_fn=work)
+
+    assert set(results) == {f"m{index}" for index in range(count)}
+    assert all(result.outcome == "verified" for result in results.values())
+    for i, j in edges:
+        assert seq.finished[f"m{j}"] < seq.started[f"m{i}"], (
+            f"m{i} started before its dependency m{j} finished"
+        )
+
+
+@given(
+    count=st.integers(min_value=2, max_value=10),
+    raw_edges=st.lists(
+        st.tuples(st.integers(min_value=0, max_value=9), st.integers(min_value=0, max_value=9)),
+        max_size=20,
+    ),
+    cycle_pair=st.tuples(
+        st.integers(min_value=0, max_value=9), st.integers(min_value=0, max_value=9)
+    ),
+    fail_flags=st.lists(st.booleans(), min_size=1, max_size=10),
+    max_workers=st.integers(min_value=1, max_value=4),
+)
+@settings(max_examples=EXAMPLES)
+def test_property_cyclic_plans_drain_or_fail_loudly_never_wedge(
+    count: int,
+    raw_edges: list[tuple[int, int]],
+    cycle_pair: tuple[int, int],
+    fail_flags: list[bool],
+    max_workers: int,
+) -> None:
+    """Dependent plans with a guaranteed cycle always drain — never wedge.
+
+    A mutual dependency guarantees a cycle however the rest of the graph
+    generates; scripted per-item failures exercise the fail-forward path
+    (a failed dependency counts as settled). A wedge is the defect; a
+    settled failure is the loud failure the pool owes the caller.
+    """
+    a, b = cycle_pair
+    if a == b or a >= count or b >= count:
+        a, b = 0, 1  # count >= 2: the fallback mutual edge is always valid
+    edges = {(i, j) for i, j in raw_edges if i != j and i < count and j < count}
+    edges |= {(a, b), (b, a)}
+    dependencies: dict[str, list[str]] = {f"m{index}": [] for index in range(count)}
+    for i, j in sorted(edges):
+        dependencies[f"m{i}"].append(f"m{j}")
+    plan = make_plan(count, dependencies=dependencies)
+    flags = (fail_flags * count)[:count]
+
+    def work(item: WorkItem, worker_id: int) -> ItemResult:
+        if flags[int(item.item_id[1:])]:
+            raise RuntimeError(f"scripted failure: {item.item_id}")
+        return _verified_result(item, worker_id)
+
+    with tempfile.TemporaryDirectory() as root:
+        results = _drain(plan, Path(root), max_workers=max_workers, work_fn=work)
+
+    assert set(results) == {f"m{index}" for index in range(count)}
+    for index in range(count):
+        expected = "failed" if flags[index] else "verified"
+        assert results[f"m{index}"].outcome == expected
 
 
 def test_scheduler_records_item_failure_without_stopping_the_pool(

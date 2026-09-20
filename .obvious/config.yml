@@ -1,0 +1,4 @@
+# obvious repo policy — auto-detected from GitHub repo settings (2026-09-18)
+default_branch: main
+merge_method: squash  # merge commit, squash, and rebase are all allowed on GitHub
+delete_branch_on_merge: false

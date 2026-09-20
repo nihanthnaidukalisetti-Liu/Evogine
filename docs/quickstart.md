@@ -127,8 +127,12 @@ engine.queue_replay(stored.id, replay_run_ids(stored.id))
 
 ```console
 $ python3 seed_candidate.py
-proposed retry-jitter-on-429 (status=ephemeral)
-queued replay: ['replay-retry-jitter-on-429-baseline', 'replay-retry-jitter-on-429-warm'] (status=candidate)
+$   # silent on success — the script prints nothing and exits 0; the store, not
+  # the script's output, is the record. The audit trail now opens with the two
+  # lifecycle events it wrote:
+$ head -n 2 .evogine/store/audit.jsonl
+{"seq":1,"ts":"2026-09-20T01:42:34.737914Z","event":"propose","record_id":"retry-jitter-on-429","from_status":null,"to_status":"ephemeral","reason":null,"run_ids":[],"pass_id":null}
+{"seq":2,"ts":"2026-09-20T01:42:34.746045Z","event":"queue_replay","record_id":"retry-jitter-on-429","from_status":"ephemeral","to_status":"candidate","reason":null,"run_ids":["replay-retry-jitter-on-429-baseline","replay-retry-jitter-on-429-warm"],"pass_id":null}
 ```
 
 ## Run an offline review

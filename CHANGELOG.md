@@ -38,6 +38,9 @@ unattended promotion remain out of scope by design.
 
 - Builder / verifier / reflector roles over a retrying model client (#4).
 - Repository decomposer with evidence-based criticality scoring (#27).
+- `evogine swarm run` — one command chaining decompose, planning, the
+  bounded orchestrator, the learning sink, and the promotion pass over a
+  repository task (#36).
 
 **Benchmarking (V2/V3)**
 
@@ -80,6 +83,11 @@ unattended promotion remain out of scope by design.
   URLs completed; the console, server, docker, and dev extras are unchanged.
 - CI completed and integrated: strict gates, coverage floor, full CLI surface,
   and an end-to-end offline loop (#13).
+
+### Fixed
+
+- Swarm cycle-breaker designations retire on settlement, keeping the
+  bounded worker pool live when a plan's dependency cycles resolve (#38).
 
 ### Security
 

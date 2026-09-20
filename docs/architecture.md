@@ -2,7 +2,8 @@
 
 What the system is made of, the contracts between its parts, and the
 vocabulary it uses to refuse things. This describes `main` as it stands;
-one clearly marked section at the end covers what is **not** here yet.
+the last section states the operational limits that remain, plainly, so
+nothing above over-claims.
 
 ## The system in one paragraph
 
@@ -21,7 +22,8 @@ refusal is explicit and named.
 ```
 src/evogine/
 ├── cli.py             # the `evogine` entry point: run, bench, shadow, decisions,
-│                      # approvals, console, init, doctor, decompose, memory
+│                      # approvals, console, init, doctor, decompose, memory,
+│                      # store, sync, swarm
 ├── config.py          # unified config: one YAML, named profiles, Decimal money
 ├── engine/
 │   ├── records.py     # LearningRecord: the versioned knowledge atom
@@ -58,8 +60,10 @@ src/evogine/
 │   │                  # KnowledgeSource and LearningSink protocols
 │   ├── clients.py     # ModelClient protocol; AnthropicClient + retrying wrapper
 │   ├── patches.py     # unified-diff application
-│   └── decomposition/ # repository decomposer: module graph, test/import
-│                      # mapping, evidence-based criticality scoring
+│   ├── decomposition/ # repository decomposer: module graph, test/import
+│   │                  # mapping, evidence-based criticality scoring
+│   └── orchestrator/  # the swarm run driver: bounded worker pool, planning,
+│                      # checkpoints, typed events, metered spend
 ├── bench/
 │   ├── harness.py     # warm-vs-cold harness; REPEAT_FLOOR; holdout guards
 │   ├── cases/         # the 10-case corpus; hidden invariants stay host-side
@@ -71,19 +75,31 @@ src/evogine/
 │   ├── runner.py      # offline KnowledgeRunner (submissions from knowledge)
 │   ├── gate_replay.py # HarnessReplayRunner: the memory gate's replay backend
 │   └── rundirs.py, prompts.py, probes.py, perturb.py, stats.py
+├── ops/               # store operations
+│   ├── backup.py      # tar snapshot of the store; fail-closed restore
+│   ├── compaction.py  # derived-index rebuild + git gc; audit trail preserved
+│   ├── benchmark.py   # synthetic-store compaction benchmark
+│   ├── migrations.py  # forward-only schema versioning, applied at store open
+│   ├── logging_setup.py # the one logging entry point: level + text|json format
+│   └── metrics.py     # in-process counters — no exporters, no sockets
 ├── console/           # localhost operator console ([console] extra)
 │   ├── launch.py      # launch-time refusals: root, identity, loopback bind
 │   ├── app.py, views.py, funnel.py   # read-only pages over existing telemetry
+│   ├── sources.py     # stores-and-sync selector: local store + sync remotes
+│   ├── swarm.py       # the /swarm board over the orchestrator's run directories
+│   ├── injection.py   # knowledge-injection panel over reviewed import bundles
 │   ├── write.py       # the two approval write routes, identity recorded
-│   └── server.py      # uvicorn entry
-└── sync/              # sync daemon ([server] extra)
+│   ├── templates/     # Jinja2 pages (autoescaped), /overview through /loop
+│   └── server.py      # uvicorn entry: `evogine console` and the module entry point
+└── sync/              # the sync daemon ([server] extra) and its client
     ├── server.py      # evogine-syncd entry: validate → resolve bind → serve
     ├── settings.py    # binding policy: loopback-first; peer-address gate
     ├── app.py         # FastAPI app: git transport + read/query routes
     ├── gitbackend.py  # git http-backend CGI handoff
     ├── stores.py      # the hosted-store registry
     ├── queries.py     # read/query surface over the stores' typed files
-    └── merge.py       # append-only audit merge driver
+    ├── merge.py       # append-only audit merge driver
+    └── client.py      # `evogine sync status|push|pull` over configured endpoints
 ```
 
 Two transport surfaces — the console and the sync daemon — are optional
@@ -228,8 +244,8 @@ non-loopback bind is refused before any socket exists.
 
 The knowledge-injection panel is the read-side view of the same reviewed
 transfer flow the `memory export`/`import` CLI drives: it lists export
-bundles from a conventional directory (`<store>/import-bundles`,
-override with `--imports-dir` at launch), renders each bundle's manifest
+bundles from a conventional directory (`<store>/imports`, override with
+`--imports-dir` at launch), renders each bundle's manifest
 — source store, schema version, per-record qualified ids — before any
 action, and offers exactly one write: the import command's own dry run,
 then a confirm POST that lands candidates through `apply_import` under
@@ -243,11 +259,16 @@ source record's provenance byte-for-byte; promotion still faces this
 store's gate and the approvals queue, so injection cannot bypass it.
 
 The stores-and-sync selector chooses which store context the read-only
-pages target: the local store, plus any sync remotes configured through
-`--config` (the default profile's `sync.endpoints`, resolved at launch,
-refusing a config that does not load). It changes what pages read, never
-what they write — writes stay bound to the local store. The `/sources`
-page renders per-source health from the existing sync client:
+pages target: the local store, plus any sync remotes read from a config
+file passed at launch (the default profile's `sync.endpoints`, resolved
+once at launch, refusing a config that does not load). The `evogine
+console` command itself takes only `--root`, `--operator`, `--host`, and
+`--port` — to serve sync remotes, launch the console's module entry
+point, which accepts the config: `python -m evogine.console.server
+--root <root> --operator <identity> --config evogine.yaml`. Without it
+the selector shows the local store alone. It changes what pages read,
+never what they write — writes stay bound to the local store. The
+`/sources` page renders per-source health from the existing sync client:
 reachability, the query API's decision counts and fleet spend, the last
 local audit position (remote trails are never stitched into one
 sequence), and an explicit refusal row for a remote that will not answer.
@@ -287,13 +308,29 @@ the same discipline in prose: bind refusals, import refusals
 file and defect, and gate failures that fail closed. A refusal always
 names what was refused and, where a fix exists, the fix.
 
-## Not on main yet: the swarm run CLI
+## The shipped command surface and what remains limited
 
-There is no CLI command on main today that drives a full swarm run
-(builder/verifier/reflector over a repository task) — the roles, the
-model clients, and the decomposer exist; the orchestrating `swarm run`-style
-entry point does not. It lands with the swarm CLI PR, and this document
-will describe its real commands then. Nothing above invents one: the
-verified CLI surface today is exactly `run`, `bench`, `shadow`,
-`decisions`, `approvals`, `console`, `init`, `doctor`, `decompose`, and
-`memory` (plus the `evogine-syncd` daemon entry point).
+`evogine --help` renders the full CLI surface: `run`, `bench`, `shadow`,
+`decisions`, `approvals`, `console`, `init`, `doctor`, `decompose`,
+`memory`, `store`, `sync`, and `swarm` — plus the `evogine-syncd` daemon
+entry point. The swarm run CLI is part of that surface:
+`evogine swarm run` drives a full swarm run over a repository task in one
+command — decompose → plan → orchestrator → learning sink → promotion
+pass — with the builder/verifier/reflector roles, bounded worker pool,
+and metered spend described above.
+
+Two operational limits remain, stated plainly:
+
+- Schema migrations are the forward-only machinery in
+  `ops/migrations.py`, applied automatically at store open (a store's
+  schema version lives in its `schema.json`; older code refuses to open
+  a newer store). There is no `evogine migrate` CLI command.
+- The metrics surface is deliberately in-process: `ops/metrics.py` keeps
+  counters that the console and dashboards read in-process. There is no
+  network metrics endpoint — no exporter, no socket.
+
+The console's sync-remotes launch path has one wrinkle worth knowing:
+`evogine console` takes no `--config` flag; the selector reads sync
+remotes when the console is launched through its module entry point,
+which does (`python -m evogine.console.server --config …`) — see
+[Operator console](#operator-console).

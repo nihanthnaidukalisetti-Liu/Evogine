@@ -13,8 +13,9 @@ Contents:
 3. [Schema migrations](#schema-migrations)
 4. [Compaction](#compaction)
 5. [Sync daemon operation](#sync-daemon-operation)
-6. [Doctor checks](#doctor-checks)
-7. [Structured logs and metrics](#structured-logs-and-metrics)
+6. [Sync client commands](#sync-client-commands)
+7. [Doctor checks](#doctor-checks)
+8. [Structured logs and metrics](#structured-logs-and-metrics)
 
 ## What is on disk
 
@@ -31,6 +32,8 @@ noted):
 | `passes/<pass_id>.json` | one manifest per promotion pass (written only if the pass finished) |
 | `runs/replay/`, `runs/gate/` | replay evidence: per-run directories and paired verdicts |
 | `runs/bench/`, `runs/shadow/` | benchmark and shadow-pass run directories (immutable, resumable) |
+| `schema.json` | the store's schema-version stamp (forward-only migrations; see below) |
+| `index.jsonl` | the derived retrieval index (rebuilt by `evogine store compact`; see below) |
 | `review.lock` | the per-store advisory lock serializing lifecycle writes (a lock file, not a store file) |
 
 ## Backup and restore
@@ -70,6 +73,29 @@ Two operational notes, both observed in practice:
   evidence, not state — but they are committed, so a backup includes
   them by design.
 
+The store also ships its own archive path (`evogine store backup`/
+`restore`), a complete tar snapshot including the full `.git` history,
+with a fail-closed restore. The git-clone path above and the tar archive
+are equivalent snapshots of committed state — clone is the zero-flags
+habit, the archive is the one-file artifact:
+
+```console
+$ evogine store backup --root .evogine/store --to /backups/store-2026-09-20.evogine-backup.tar
+backup: /backups/store-2026-09-20.evogine-backup.tar (86 files, 266240 bytes)
+$ evogine store restore --from /backups/store-2026-09-20.evogine-backup.tar --to /srv/project/.evogine/store
+restored: /srv/project/.evogine/store
+```
+
+Restore refuses to overwrite a non-empty destination and verifies store
+post-conditions (git history, schema stamp, records) before reporting
+success:
+
+```console
+$ evogine store restore --from /backups/store-2026-09-20.evogine-backup.tar --to /srv/project/.evogine/store
+error: refusing to restore into a non-empty directory: /srv/project/.evogine/store
+(exit=1 — point --to at an empty or absent directory)
+```
+
 The sync daemon (next sections) is also a live replication path: every
 hosted store is itself a git repository served over git's smart-HTTP
 protocol, so `git fetch` against the daemon is an incremental backup
@@ -77,41 +103,79 @@ mechanism for remote machines.
 
 ## Schema migrations
 
-**No migration tooling exists on main today.** There is no `evogine
-migrate` command, and this runbook will not invent one.
+Store schemas are versioned and migrated forward-only: the store stamps
+its schema version in `schema.json` at its root (versioned content like
+everything else the store holds), and the machinery in
+`ops/migrations.py` applies registered migrations one step at a time,
+each step committing its change to the store's git history. It is wired
+into the engine's store open path — there is no migration step for an
+operator to run.
 
-What exists instead is a deliberate compatibility property: the record
-contract evolves by adding fields with defaults, so older record JSON
-round-trips through newer readers unchanged (the V2 lifecycle fields —
+The enforced contract:
+
+- **Forward-only.** An explicit request to go below the store's current
+  version refuses loudly, with both versions named; a downgrade is never
+  a silent no-op.
+- **Back-compat is absolute.** Stores that predate the stamp read as
+  version 1 and keep working unchanged; opening a store upgrades it
+  explicitly.
+- **Older code refuses newer stores.** Opening a store whose schema
+  version exceeds the running build's refuses — reading a schema you do
+  not understand is how silent corruption happens; refusing is the
+  visible alternative.
+- **Registry gaps refuse.** A version with no registered migration step
+  is a bug and raises rather than skipping ahead.
+
+The registry ships with one real step — version 1 → 2, "adopt schema
+versioning", which stamps `schema.json` into the store's history. Future
+format changes register their own steps against this machinery.
+
+What does **not** exist is a `evogine migrate` CLI command — migrations
+are applied automatically at store open, not driven by hand. Record-level
+evolution keeps the older compatibility property: the record contract
+changes by adding fields with defaults, so older record JSON round-trips
+through newer readers unchanged (the V2 lifecycle fields —
 `merged_sources`, `retired_at`, and friends — all defaulted this way).
 Records are versioned pydantic contracts; a contract violation is a
 refusal naming the defect, never a silent default.
 
-Store-growth tooling — audited compaction, migration commands, and a
-`store` maintenance surface — is planned as a follow-up ops-hardening
-change. When it lands on main, this section documents its real commands
-and numbers; until then, nothing here pretends they exist.
-
 ## Compaction
 
-**Audited compaction is not on main today** — no CLI command, and no
-published benchmark numbers for it. The runbook will not quote numbers
-that were not measured.
+`evogine store compact` rebuilds the store's derived retrieval index and
+garbage-collects the store's git repo. The audit trail and record files
+are untouched: compaction adds one derived file (`index.jsonl`) and
+repacks git's object store — HEAD and the commit graph's meaning are
+preserved, and the win is fewer parsed files on hot reads and a smaller
+`.git`:
 
-What is true today:
+```console
+$ evogine store compact --root .evogine/store
+compacted: 4 records indexed into .evogine/store/index.jsonl (3479 bytes)
+```
 
-- The store grows one JSON file per record plus git history; one
-  lifecycle transition is one commit.
-- The store's own merge/duplicate machinery (`find_duplicates()`,
-  `merge()` in the store API) is knowledge-level deduplication, not
-  history compaction — it merges duplicate records into survivors with
-  provenance, leaving the audit trail intact.
-- Git's own housekeeping applies to the store repo as to any git repo;
-  the engine commits with git's defaults and takes no gc action of its
-  own.
+The store's own merge/duplicate machinery (`find_duplicates()`,
+`merge()` in the store API) remains knowledge-level deduplication, not
+history compaction — it merges duplicate records into survivors with
+provenance, leaving the audit trail intact.
 
-When compaction lands with benchmark numbers, this section will carry
-the measured figures and the command that produced them.
+Before committing to compaction at scale, `evogine store benchmark`
+measures duplicate detection and retrieval on a deterministic synthetic
+store, before versus after the index rebuild. The default is 10,000
+records; scale it down for a quick run (output prints on completion):
+
+```console
+$ evogine store benchmark --records 500 --dir /tmp/evogine-bench-docs
+store benchmark: 500 records (promoted=72, candidates=428, repeats=3)
+duplicate detection: 189.549 ms -> 38.947 ms (21418 exact pairs)
+retrieval per query: 24.235 ms -> 20.429 ms (5 probes, k=5)
+store size: 18775.9 KiB -> 19116.9 KiB (derived index included)
+```
+
+The measured trade: duplicate detection and retrieval get several times
+faster on the rebuilt index; the store on disk grows by the index's own
+size. Run the benchmark at your own record scale and hardware before
+treating any one run's numbers as typical — these are one measurement,
+not a claim.
 
 ## Sync daemon operation
 
@@ -234,6 +298,83 @@ JSON conflicts visibly in stock git, and the operator reconciles — the
 daemon never rewrites knowledge. The git history is the reconciliation
 record; no global ordering across stores is invented.
 
+## Sync client commands
+
+The daemon's client half ships as `evogine sync` — three commands over
+the endpoints configured in `evogine.yaml` under
+`profiles.<name>.sync.endpoints` (each endpoint a `name`, an `url`, and
+the hosted `store` it names — see [Doctor checks](#doctor-checks)). All
+outputs below were executed against a live daemon (the examples' daemon
+runs on port 8791; the documented default is 8766 — the console owns
+8765, so the daemon takes the adjacent port).
+
+`sync status` queries every configured remote's store and rolls the
+fleet's spend into one merged, per-machine-attributed view:
+
+```console
+$ evogine sync status
+- local (store 'alpha'): 0 decision(s), 0 promoted, 0 pending approval(s)
+  spend: this machine: 0 run(s), no spend recorded
+
+merged spend (1 of 1 machine(s) reporting):
+  local: 0 run(s), no spend recorded
+  total: no spend recorded on any reporting machine
+(exit=0)
+```
+
+`sync push` publishes local store commits to a configured remote — a
+normal git push under the hosted store's advisory lock:
+
+```console
+$ evogine sync push
+sync push: transferred c58de599f2a8 to http://127.0.0.1:8791/git/alpha (refs/heads/master)
+  store root: store
+(exit=0)
+```
+
+A push whose hosted store has commits the local store lacks refuses —
+pull first, then push:
+
+```console
+$ evogine sync push
+error: push to remote 'local' refused (non-fast-forward): the hosted store has commits this store lacks — run 'evogine sync pull' first, then push
+(exit=1)
+```
+
+`sync pull` fetches and merges the remote's hosted store into the local
+store — the append-only audit merge driver (registered above) is what
+makes two machines' audit trails merge instead of conflict:
+
+```console
+$ evogine sync pull
+sync pull: merged the hosted store 'alpha' from remote 'local' — local HEAD is now f3cbbabf579c
+  store root: store
+(exit=0)
+```
+
+A pull git cannot merge cleanly aborts and refuses — nothing changes,
+and the client never rewrites knowledge:
+
+```console
+$ evogine sync pull
+error: pull from remote 'local' hit a conflict git cannot merge cleanly — the merge was aborted and nothing changed; reconcile the store by hand (the client never rewrites knowledge): fatal: refusing to merge unrelated histories
+(exit=1)
+```
+
+Two config refusals, both verified: with no endpoints configured, the
+command refuses rather than reporting an empty fleet as if it were a
+good one:
+
+```console
+$ evogine sync status
+error: no sync endpoints configured — add one under profiles.<name>.sync.endpoints in the config
+(exit=1)
+```
+
+and an endpoint without a `store` name refuses — the client never
+guesses which hosted store it serves (see
+[Doctor checks](#doctor-checks) for the exact refusal).
+
 ## Doctor checks
 
 `evogine doctor [--config PATH]` renders environment readiness with
@@ -252,30 +393,66 @@ states of a machine without a Docker daemon or a key):
 | `sync` | each configured sync endpoint answers within 2 s | unreachable → `fail` (fix: start the daemon or correct the URL); wrong path answering → `fail`; none configured → `ok` ("nothing to probe") |
 
 Sync endpoints are declared in `evogine.yaml` under
-`profiles.<name>.sync.endpoints` (each a `name` and an `url` — the
-config refuses duplicates and non-http schemes at load time). Run doctor
+`profiles.<name>.sync.endpoints` — each endpoint carries a `name`, an
+`url`, and the `store` name of the hosted store it serves. The config
+refuses duplicate names and non-http schemes at load time; `store` is
+optional at load (pre-sync configs load unchanged, and `doctor` still
+probes the URL) but a sync command against an endpoint without one
+refuses visibly — the client never guesses a store name:
+
+```console
+$ evogine sync status
+- local: REFUSED — sync endpoint 'local' declares no store — add 'store: <name>' under the endpoint in the config (the daemon hosts stores by name; the client never guesses one)
+
+merged spend: no remote reported — nothing is summed (absence is not zero)
+(exit=1)
+```
+
+A verified probe line with the store named:
+
+```console
+$ evogine doctor
+  sync     ok    endpoint 'local' answered (HTTP 200) at http://127.0.0.1:8791/health (store 'alpha')
+```
+
+Run doctor
 after any config or infrastructure change; a cron-friendly exit code
 makes it scriptable as a readiness probe.
 
 ## Structured logs and metrics
 
-**Structured log sinks and a metrics endpoint are not on main today** —
-they land with the ops-hardening change, and this section will document
-the real config knobs and output formats then. No invented field names.
+Every process configures logging exactly once, through
+`ops/logging_setup.py` at the CLI's entry point — the config's
+`logging` section is the surface:
 
-What exists today, honestly:
+- `logging.level` — `debug`/`info`/`warning`/`error` (default `info`).
+- `logging.format` — `text` (default; human-oriented single lines with
+  structured fields appended as `key=value`) or `json` (one JSON object
+  per line: `ts`, `level`, `logger`, `message`, plus the event's
+  structured fields — for log shippers and the dashboard's log view).
 
-- The config's `logging.level` knob (`debug`/`info`/`warning`/`error`)
-  is the logging surface that exists; the sync daemon serves with
-  uvicorn's `info`-level logs.
+Logs go to stderr; stdout is reserved for command output. There is no
+third sink and no per-module handler — library code only emits typed
+fields, and format/level stay the config file's decision.
+
+The metrics surface is deliberately small and in-process:
+`ops/metrics.py` keeps a process-wide registry of counters
+(`evogine_store_transitions_total`, `evogine_gate_decisions_total`,
+`evogine_funnel_stage_total`, each name and label pinned to a checked
+vocabulary) read in-process by the console and dashboard. There are **no
+exporters and no sockets** — no network metrics endpoint exists, by
+design, so a core install gains nothing it does not use.
+
+What already existed and remains the record:
+
 - The audit trail (`audit.jsonl`) **is** the structured event log of
   record: append-only JSON lines, one per lifecycle event, with
   sequence, timestamp, event, record id, status transition, reason,
   replay run ids, and pass id — readable with `jq` and tailable like
   any JSONL log.
 - Promotion telemetry (`decisions/`, `passes/`) and run evidence
-  (`runs/`) are the metrics source of record; the query API above
-  exposes them as JSON for programmatic monitoring, and
+  (`runs/`) are the metrics source of record; the sync daemon's query
+  API above exposes them as JSON for programmatic monitoring, and
   `GET /api/stores/{name}/overview` is the cheapest live health probe
   of a store's pipeline.
 - `evogine doctor` is the machine-checkable readiness surface (exit

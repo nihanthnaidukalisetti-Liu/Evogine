@@ -42,9 +42,15 @@ def temp_store_root(prefix: str) -> Path:
     Engine skips its own init when ``.git`` already exists).
     """
     root = Path(tempfile.mkdtemp(prefix=prefix))
-    subprocess.run(
-        ["git", "init", "-q"], cwd=root, check=True, capture_output=True, text=True
+    proc = subprocess.run(
+        ["git", "init", "-q"], cwd=root, check=False, capture_output=True, text=True
     )
+    if proc.returncode != 0:
+        # Surface git's own message: a bare exit code (e.g. 128 from an
+        # environment-level failure) is undiagnosable from CI logs alone.
+        raise RuntimeError(
+            f"git init failed in {root} ({proc.returncode}): {proc.stderr.strip()}"
+        )
     config = root / ".git" / "config"
     with config.open("a", encoding="utf-8") as fh:
         fh.write("[gc]\n\tauto = 0\n\tautoDetach = false\n")

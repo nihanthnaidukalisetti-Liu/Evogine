@@ -72,6 +72,21 @@ merge surface under the engine's per-store advisory lock. Every command
 fails closed: an unreachable, misconfigured, or policy-refusing remote is
 rendered as the refusal it is — never a silent skip, never a fail-open
 write.
+``swarm run`` (V4) chains the swarm's existing pieces end-to-end over a
+target repository: the unified config's named profile resolves the store,
+pool bounds, dollar ceiling, and pinned model; the repository is decomposed
+into the DAG, planned into criticality-ordered work items, and executed on
+the orchestrator's bounded pool — every model call metered against the
+profile's exact ``Decimal`` ceiling, every landed learning proposed through
+the LearningSink, ephemeral until human-approved, never any new write path.
+Landed learnings are queued for replay and decided through the existing
+promotion pass, so ``evogine decisions funnel`` reports swarm-run decisions
+with the exact refusal vocabulary — refusals at every stage (decomposition
+failure, spend refusal, gate refusal) are recorded under ``gate_error`` and
+never swallowed. The run directory's typed JSONL event feed is the
+mission-control dashboard's input, unchanged. Runs resume: an interrupted
+run auto-resumes from its checkpoint markers with no duplicated spend, and
+resuming a completed run is a visible no-op with the prior result.
 """
 
 from __future__ import annotations
@@ -79,17 +94,20 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import secrets
 import shutil
 import subprocess
 import sys
 import tempfile
-from decimal import Decimal
+from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import urlopen
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from evogine import __version__
 from evogine.bench.budgets import (
@@ -100,7 +118,7 @@ from evogine.bench.budgets import (
     reconcile_spend,
 )
 from evogine.bench.cases import BenchCase, default_corpus
-from evogine.bench.gate_replay import HarnessReplayRunner
+from evogine.bench.gate_replay import HarnessReplayRunner, replay_run_ids
 from evogine.bench.harness import (
     REPEAT_FLOOR,
     BenchHarness,
@@ -118,7 +136,7 @@ from evogine.bench.protocol import (
     pre_run_validate,
 )
 from evogine.bench.replay import ReplaySchedule, build_replay_requests
-from evogine.bench.rundirs import RunCompleteError, open_run
+from evogine.bench.rundirs import RunCompleteError, RunDirectory, open_run
 from evogine.bench.runner import KnowledgeRunner
 from evogine.bench.shadow import ShadowRefusalError, load_shadow_candidate, run_shadow_pass
 from evogine.config import (
@@ -151,6 +169,7 @@ from evogine.gates.memory_gate import MemoryGate, run_promotion_pass
 from evogine.gates.telemetry import (
     DecisionLog,
     DecisionStage,
+    PromotionDecision,
     RunsEvidenceSink,
     TelemetryError,
 )
@@ -161,6 +180,18 @@ from evogine.ops.compaction import CompactionError, compact_store
 # --- V4 swarm: repository decomposer (appended in its own section to ease rebases) ---
 from evogine.swarm.clients import AnthropicClient, ModelClient, RetryingModelClient
 from evogine.swarm.decomposition import DecompositionError, decompose, render_summary_table
+from evogine.swarm.orchestrator import (  # stable public API — consume, do not modify
+    CheckpointError,
+    CompleteEvent,
+    EventLogError,
+    MissingApiKeyRefused,
+    RunSettings,
+    SpendEvent,
+    SwarmOrchestrator,
+    plan_work,
+    read_events,
+    resolve_api_key,
+)
 
 # --- V4 sync: client half of the daemon (appended in its own section to ease rebases) ---
 from evogine.sync.client import (
@@ -570,6 +601,78 @@ def main(argv: list[str] | None = None) -> int:
             default=None,
             help="config file to read (default: ./evogine.yaml)",
         )
+    # --- V4 swarm: the swarm run CLI (appended in its own section so a
+    # parallel task's parser work rebases without touching this block) ---
+    swarm_parser = subparsers.add_parser(
+        "swarm",
+        help="swarm runs over a target repository (V4)",
+    )
+    swarm_subparsers = swarm_parser.add_subparsers(dest="swarm_command", required=True)
+    swarm_run_parser = swarm_subparsers.add_parser(
+        "run",
+        help="decompose → plan → orchestrator → learning sink → promotion pass",
+    )
+    swarm_run_parser.add_argument(
+        "--repo",
+        required=True,
+        help="path to the Python repository the swarm works on",
+    )
+    swarm_run_parser.add_argument(
+        "--config",
+        default=None,
+        dest="config_path",
+        help="unified config file (default: ./evogine.yaml); the named profile "
+        "supplies the store root, pool bounds, dollar ceiling, and pinned model",
+    )
+    swarm_run_parser.add_argument(
+        "--profile",
+        default=None,
+        dest="profile_name",
+        help="named profile to run under (default: the config's default_profile)",
+    )
+    swarm_run_parser.add_argument(
+        "--runs-root",
+        default=None,
+        dest="runs_root",
+        help="swarm run directories root (default: <store-root>/runs/swarm)",
+    )
+    swarm_run_parser.add_argument(
+        "--resume",
+        default=None,
+        help="resume a specific run id; resuming a completed run is a visible "
+        "no-op (default: auto-resume the newest incomplete run, else start fresh)",
+    )
+    swarm_run_parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="start a new run even when an incomplete run exists",
+    )
+    swarm_run_parser.add_argument(
+        "--repeats",
+        type=int,
+        default=8,
+        help=f"repetitions per replay arm in the post-run promotion pass "
+        f"(floor: {REPEAT_FLOOR}; default: 8)",
+    )
+    swarm_run_parser.add_argument(
+        "--input-price-per-mtok-usd",
+        default=None,
+        dest="input_price_per_mtok_usd",
+        help="input price per million tokens in USD (required)",
+    )
+    swarm_run_parser.add_argument(
+        "--output-price-per-mtok-usd",
+        default=None,
+        dest="output_price_per_mtok_usd",
+        help="output price per million tokens in USD (required)",
+    )
+    swarm_run_parser.add_argument(
+        "--max-call-input-tokens",
+        type=int,
+        default=None,
+        dest="max_call_input_tokens",
+        help="the per-call input bound the spend reservation assumes (required)",
+    )
 
     args = parser.parse_args(argv)
     if args.command == "run":
@@ -642,6 +745,19 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "sync" and args.sync_command in ("push", "pull"):
         return _sync_transfer(
             args.sync_command, args.remote, args.root, config_path=args.config_path
+        )
+    if args.command == "swarm" and args.swarm_command == "run":
+        return _swarm_run(
+            args.repo,
+            config_path=args.config_path,
+            profile_name=args.profile_name,
+            runs_root=args.runs_root,
+            resume=args.resume,
+            fresh=args.fresh,
+            repeats=args.repeats,
+            input_price_per_mtok_usd=args.input_price_per_mtok_usd,
+            output_price_per_mtok_usd=args.output_price_per_mtok_usd,
+            max_call_input_tokens=args.max_call_input_tokens,
         )
     return 0  # unreachable: subcommands are required
 
@@ -1693,9 +1809,7 @@ def _render_sync_status(statuses: list[RemoteStatus], merged: MergedSpend) -> st
         remote = status.remote
         overview = status.overview
         if remote is None or overview is None or status.spend is None:
-            lines.append(
-                f"- {status.label}: REFUSED — incomplete status from the remote"
-            )
+            lines.append(f"- {status.label}: REFUSED — incomplete status from the remote")
             continue
         lines.append(
             f"- {status.label} (store '{remote.store}'): "
@@ -1716,14 +1830,11 @@ def _render_sync_status(statuses: list[RemoteStatus], merged: MergedSpend) -> st
     refused = any(not status.ok for status in statuses)
     lines.append("")
     if not merged.machines:
-        lines.append(
-            "merged spend: no remote reported — nothing is summed (absence is not zero)"
-        )
+        lines.append("merged spend: no remote reported — nothing is summed (absence is not zero)")
         return "\n".join(lines)
     qualifier = " — refusals are never summed away" if refused else ""
     lines.append(
-        f"merged spend ({len(merged.machines)} of {len(statuses)} machine(s) "
-        f"reporting{qualifier}):"
+        f"merged spend ({len(merged.machines)} of {len(statuses)} machine(s) reporting{qualifier}):"
     )
     for machine in merged.machines:
         lines.append(
@@ -1739,7 +1850,9 @@ def _render_sync_status(statuses: list[RemoteStatus], merged: MergedSpend) -> st
     if merged.total_actual_cost_usd is None:
         lines.append("  total: no spend recorded on any reporting machine")
     else:
-        total = f"  total: {merged.recorded_runs} run(s), actual ${merged.total_actual_cost_usd:.4f}"
+        total = (
+            f"  total: {merged.recorded_runs} run(s), actual ${merged.total_actual_cost_usd:.4f}"
+        )
         if merged.total_overage_usd is not None:
             total += f", overage ${merged.total_overage_usd:.4f}"
         if merged.within_ceiling is not None:
@@ -1762,9 +1875,7 @@ def _sync_transfer(
     try:
         profile = load_config(cfg_path).profile()
         remote = resolve_remote(profile.sync.endpoints, remote_name)
-        store_root = (
-            Path(root) if root is not None else Path(profile.store.learning_root)
-        )
+        store_root = Path(root) if root is not None else Path(profile.store.learning_root)
         result: PushResult | PullResult
         if operation == "push":
             result = push_store(store_root, remote)
@@ -1775,9 +1886,7 @@ def _sync_transfer(
     except SyncClientError as exc:
         return _refuse(str(exc))
     if isinstance(result, PushResult):
-        print(
-            f"sync push: transferred {result.head[:12]} to {result.url} ({result.ref})"
-        )
+        print(f"sync push: transferred {result.head[:12]} to {result.url} ({result.ref})")
         print(f"  store root: {store_root}")
         if result.uncommitted:
             print(
@@ -1791,4 +1900,418 @@ def _sync_transfer(
         f"'{result.remote}' — local HEAD is now {result.head[:12]}"
     )
     print(f"  store root: {store_root}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# V4 swarm: the `swarm run` CLI — one command chaining the existing pieces.
+# The CLI owns only the chain (config → store → decompose → plan →
+# orchestrator → sink → promotion pass); every piece itself — decomposer,
+# orchestrator, engine, gate — is stable public API consumed unmodified.
+# ---------------------------------------------------------------------------
+
+_SWARM_RUNS_DIRNAME = "swarm"
+"""Run directories live under ``<store-root>/runs/swarm`` unless overridden."""
+
+_RUN_ID_SHAPE = re.compile(r"\d{8}T\d{6}-[0-9A-Fa-f]{8}\Z")
+"""The id shape ``open_run`` generates (UTC stamp + 8 hex chars).
+
+Discovery only ever auto-resumes directories ``open_run`` itself created;
+matching the generator's shape keeps foreign directories (a checkout, a
+stray folder) out of the resume path instead of resuming them by mistake.
+"""
+
+
+def _build_swarm_client(*, model: str, api_key: str) -> ModelClient:
+    """The swarm run's provider seam: bounded retries around one provider.
+
+    Module-level so offline tests can inject a fake client by patching this
+    one function — the same seam shape the live bench uses.
+    """
+    return RetryingModelClient(AnthropicClient(model=model, api_key=api_key))
+
+
+def _swarm_refuse(message: str) -> int:
+    """Print a fail-closed refusal and return the process exit code."""
+    print(f"error: {message}", file=sys.stderr)
+    return 1
+
+
+def _latest_incomplete_run(runs_root: Path) -> str | None:
+    """The newest resumable run id under ``runs_root``, or ``None``.
+
+    Run ids open with a UTC timestamp, so name order is chronological.
+    Completeness is asked through :class:`RunDirectory` — the run
+    directory's own contract, not a copied marker-name constant — and
+    foreign directories that are not run ids are never "resumed".
+    """
+    if not runs_root.is_dir():
+        return None
+    newest: str | None = None
+    for name in sorted(child.name for child in runs_root.iterdir() if child.is_dir()):
+        if _RUN_ID_SHAPE.fullmatch(name) is None:
+            continue
+        if RunDirectory(runs_root, name).is_complete():
+            continue
+        newest = name
+    return newest
+
+
+class SwarmSpendReport(BaseModel):
+    """The run's spend ledger, reconciled from its persisted event feed.
+
+    The PR #19 pattern: the report is computed from the records on disk —
+    the run's own ``events.jsonl`` — never from a caller's memory, so a
+    resumed run's report accounts for every metered call the feed holds.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    run_id: str
+    ceiling_usd: Decimal = Field(gt=0)
+    calls: int = Field(default=0, ge=0)
+    calls_ok: int = Field(default=0, ge=0)
+    calls_failed: int = Field(default=0, ge=0)
+    calls_without_usage: int = Field(default=0, ge=0)
+    input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
+    cost_usd: Decimal = Field(default=Decimal(0), ge=0)
+    spent_usd: Decimal = Field(default=Decimal(0), ge=0)
+
+    def render(self) -> str:
+        """One-line human summary of the reconciled ledger."""
+        return (
+            f"spend: {self.calls} call(s) ({self.calls_ok} ok, {self.calls_failed} failed"
+            f"{', ' + str(self.calls_without_usage) + ' without usage' if self.calls_without_usage else ''})"
+            f" — ${self.spent_usd} of ${self.ceiling_usd} ceiling"
+            f" ({self.input_tokens} in / {self.output_tokens} out tokens)"
+        )
+
+
+def _swarm_spend_report(run: RunDirectory, *, ceiling_usd: Decimal) -> SwarmSpendReport:
+    """Reconcile the run's spend ledger from its persisted event feed."""
+    calls = calls_ok = calls_failed = calls_without_usage = 0
+    input_tokens = output_tokens = 0
+    cost = Decimal(0)
+    spent = Decimal(0)
+    for event in read_events(run):
+        if not isinstance(event, SpendEvent):
+            continue
+        calls += 1
+        spent = event.spent_usd  # the ledger total after this call
+        cost += event.cost_usd
+        if event.ok:
+            calls_ok += 1
+            if event.input_tokens is None or event.output_tokens is None:
+                calls_without_usage += 1
+            else:
+                input_tokens += event.input_tokens
+                output_tokens += event.output_tokens
+        else:
+            calls_failed += 1
+    return SwarmSpendReport(
+        run_id=run.run_id,
+        ceiling_usd=ceiling_usd,
+        calls=calls,
+        calls_ok=calls_ok,
+        calls_failed=calls_failed,
+        calls_without_usage=calls_without_usage,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cost_usd=cost,
+        spent_usd=spent,
+    )
+
+
+def _swarm_refusal_id(kind: str) -> str:
+    """A stable, filesystem-safe decision id for a run-level refusal."""
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
+    return f"swarm-{kind}-{stamp}-{secrets.token_hex(4)}"
+
+
+def _record_swarm_refusal(
+    store_root: Path, *, proposal_id: str, detail: str, evidence_ref: str | None = None
+) -> None:
+    """Record a swarm-run refusal in the store's decision log.
+
+    ``GATE_ERROR`` is the vocabulary's "infrastructure, not knowledge;
+    retryable" home — a swarm run refused before or during execution is
+    exactly that, so the funnel reports it in the same vocabulary every
+    other refusal speaks and a refused run is never invisible.
+    """
+    DecisionLog(store_root).record(
+        PromotionDecision(
+            proposal_id=proposal_id,
+            learning_id="",
+            promoted=False,
+            stage=DecisionStage.GATE_ERROR,
+            reason=f"gate_error: {detail}",
+            evidence_ref=evidence_ref,
+        )
+    )
+
+
+def _swarm_promotion_gate(engine: Engine, store_root: Path, *, repeats: int) -> MemoryGate:
+    """The existing promotion gate, wired exactly as ``evogine run`` wires it."""
+    return MemoryGate(
+        runner=HarnessReplayRunner(
+            engine,
+            KnowledgeRunner(),
+            corpus=None,
+            repeats=repeats,
+            runs_root=store_root / "runs" / "replay",
+        ),
+        log=DecisionLog(store_root),
+        approvals=ApprovalLog(store_root),
+        evidence=RunsEvidenceSink(store_root),
+    )
+
+
+def _swarm_no_op(runs_root: Path, run_id: str) -> int:
+    """A completed run's resume: a visible no-op showing the prior result."""
+    run = RunDirectory(runs_root, run_id)
+    try:
+        events = read_events(run)
+    except EventLogError as exc:
+        return _swarm_refuse(f"run {run_id}'s event feed is corrupt: {exc}")
+    prior = next((event for event in reversed(events) if isinstance(event, CompleteEvent)), None)
+    print(f"run {run_id} is already complete — nothing to resume (completed runs are immutable)")
+    if prior is not None:
+        print(
+            f"  prior result: {prior.items_completed}/{prior.items_total} item(s) completed, "
+            f"${prior.spent_usd} of ${prior.ceiling_usd} ceiling, {prior.resumed_items} resumed"
+        )
+    print(f"  run dir: {run.directory}")
+    return 0
+
+
+def _swarm_run(
+    repo: str,
+    *,
+    config_path: str | None,
+    profile_name: str | None,
+    runs_root: str | None,
+    resume: str | None,
+    fresh: bool,
+    repeats: int,
+    input_price_per_mtok_usd: str | None,
+    output_price_per_mtok_usd: str | None,
+    max_call_input_tokens: int | None,
+) -> int:
+    """Drive one swarm run end-to-end over ``repo``; every refusal fails closed.
+
+    The chain, all existing pieces: the unified config's named profile
+    resolves the store, pool bounds, dollar ceiling, and pinned model; the
+    repository is decomposed into the DAG and planned into
+    criticality-ordered work items; the orchestrator's bounded pool runs
+    them with every call metered against the exact ``Decimal`` ceiling and
+    every landed learning proposed through the LearningSink (ephemeral
+    until human-approved — no new write path anywhere). This run's landed
+    learnings are then queued for replay and decided through the existing
+    promotion pass, so ``evogine decisions funnel`` reports the run's
+    submissions and refusals in the exact telemetry vocabulary, and the
+    run directory's typed JSONL event feed is the dashboard's input,
+    unchanged.
+    """
+    if resume is not None and fresh:
+        return _swarm_refuse("use --resume or --fresh, not both")
+
+    repo_path = Path(repo)
+    if not repo_path.is_dir():
+        return _swarm_refuse(f"--repo path is not a directory: {repo}")
+
+    cfg_file = Path(config_path) if config_path is not None else default_config_path()
+    try:
+        config = load_config(cfg_file)
+        profile = config.profile(profile_name)
+    except ConfigError as exc:
+        return _swarm_refuse(str(exc))
+
+    ceiling = profile.budget.max_run_cost_usd
+    if not ceiling.is_finite() or ceiling <= 0:
+        # The loader refuses unusable ceilings today; this guard keeps the
+        # swarm path fail-closed even if the config schema ever loosens.
+        return _swarm_refuse(
+            f"profile {profile_name or config.default_profile!r} has no usable budget "
+            f"ceiling ({ceiling}) — a swarm run refuses to start without one"
+        )
+
+    if (
+        input_price_per_mtok_usd is None
+        or output_price_per_mtok_usd is None
+        or max_call_input_tokens is None
+    ):
+        missing = ", ".join(
+            flag
+            for flag, value in (
+                ("--input-price-per-mtok-usd", input_price_per_mtok_usd),
+                ("--output-price-per-mtok-usd", output_price_per_mtok_usd),
+                ("--max-call-input-tokens", max_call_input_tokens),
+            )
+            if value is None
+        )
+        return _swarm_refuse(
+            f"swarm run requires {missing}: the spend expectation must be "
+            "declared in full — an absent knob would project zero and disarm the ceiling"
+        )
+    try:
+        input_price = Decimal(str(input_price_per_mtok_usd))
+        output_price = Decimal(str(output_price_per_mtok_usd))
+        settings = RunSettings.from_config(
+            config,
+            profile=profile_name,
+            input_price_per_mtok_usd=input_price,
+            output_price_per_mtok_usd=output_price,
+            max_call_input_tokens=max_call_input_tokens,
+        )
+    except (InvalidOperation, ConfigError, ValueError) as exc:
+        return _swarm_refuse(f"spend policy refused: {exc}")
+
+    store_root = Path(profile.store.learning_root)
+    try:
+        engine = Engine(store_root)
+    except (OSError, StoreError) as exc:
+        return _swarm_refuse(f"learning store at {store_root} is unreachable: {exc}")
+
+    try:
+        api_key = resolve_api_key(os.environ, settings.api_key_env)
+    except MissingApiKeyRefused as exc:
+        _record_swarm_refusal(
+            store_root, proposal_id=_swarm_refusal_id("missing-api-key"), detail=str(exc)
+        )
+        return _swarm_refuse(str(exc))
+    client = _build_swarm_client(model=profile.provider.model, api_key=api_key)
+
+    try:
+        dag = decompose(repo_path)
+    except DecompositionError as exc:
+        _record_swarm_refusal(
+            store_root,
+            proposal_id=_swarm_refusal_id("decomposition"),
+            detail=f"swarm run refused at decomposition: {exc}",
+        )
+        return _swarm_refuse(f"decomposition refused: {exc}")
+    plan = plan_work(dag)
+    if not plan.items:
+        # The empty-plan case is the non-Python tree: the decomposer found
+        # nothing to work on, and a swarm run with nothing to do is a
+        # configuration mistake — fail closed with telemetry, not a shrug.
+        _record_swarm_refusal(
+            store_root,
+            proposal_id=_swarm_refusal_id("empty-plan"),
+            detail=f"swarm run refused at planning: no Python work items found in {repo}",
+        )
+        return _swarm_refuse(
+            f"decomposition refused: no Python work items found in {repo} — "
+            "the swarm needs a Python tree to work on"
+        )
+
+    runs = Path(runs_root) if runs_root is not None else store_root / "runs" / _SWARM_RUNS_DIRNAME
+    resume_id: str | None = None
+    if resume is not None:
+        if RunDirectory(runs, resume).is_complete():
+            return _swarm_no_op(runs, resume)
+        resume_id = resume
+        print(f"resuming run {resume_id}")
+    elif not fresh:
+        resume_id = _latest_incomplete_run(runs)
+        if resume_id is not None:
+            print(f"resuming incomplete run {resume_id} (use --fresh to start a new run)")
+
+    orchestrator = SwarmOrchestrator(
+        settings=settings,
+        client=client,
+        sink=engine,
+        knowledge=engine,
+        # No verifier wired here: the ops layer owns that adapter, and this
+        # task consumes it rather than duplicating it — unverified completion
+        # is the orchestrator's honest record.
+        verify=None,
+    )
+    try:
+        outcome = orchestrator.run(plan, runs, resume_run_id=resume_id)
+    except (CheckpointError, EventLogError) as exc:
+        # A corrupt checkpoint or event surface is infrastructure, not knowledge.
+        _record_swarm_refusal(
+            store_root,
+            proposal_id=_swarm_refusal_id("orchestrator"),
+            detail=f"swarm run infrastructure failure: {exc}",
+        )
+        return _swarm_refuse(str(exc))
+
+    run_dir = RunDirectory(runs, outcome.run_id)
+    spend = _swarm_spend_report(run_dir, ceiling_usd=settings.spend.ceiling_usd)
+    run_dir.write_artifact("spend-report", spend.model_dump_json(indent=2) + "\n")
+
+    # Land every learning this run proposed into the existing lifecycle:
+    # ephemeral → candidate via the store's own queue_replay, exactly the
+    # transition the promotion pass reviews. Already-queued records (an
+    # earlier attempt of this run) are skipped — resume is idempotent.
+    queued: list[str] = []
+    for item in outcome.items:
+        if item.learning_id is None:
+            continue
+        try:
+            record = engine.get(item.learning_id)
+        except StoreError as exc:
+            return _swarm_refuse(
+                f"run {outcome.run_id} recorded learning {item.learning_id!r} "
+                f"but the store refuses to read it: {exc}"
+            )
+        if record.status != "ephemeral":
+            continue
+        engine.queue_replay(record.id, replay_run_ids(record.id))
+        queued.append(record.id)
+
+    decisions: list[PromotionDecision] = []
+    if queued:
+        # Only this run's submissions flow on: the pass decides the store's
+        # whole candidate set, which now includes this run's learnings.
+        try:
+            decisions = run_promotion_pass(
+                engine, _swarm_promotion_gate(engine, store_root, repeats=repeats)
+            )
+        except (StoreError, TelemetryError, ValueError) as exc:
+            return _swarm_refuse(f"promotion pass failed after the run: {exc}")
+
+    if outcome.outcome == "refused":
+        _record_swarm_refusal(
+            store_root,
+            proposal_id=f"swarm-{outcome.run_id}",
+            detail=f"swarm run {outcome.run_id} refused: {outcome.detail}",
+            evidence_ref=(
+                f"runs/{_SWARM_RUNS_DIRNAME}/{outcome.run_id}" if runs_root is None else None
+            ),
+        )
+
+    print(f"swarm run {outcome.run_id}: {outcome.outcome}")
+    if outcome.detail:
+        print(f"  detail: {outcome.detail}")
+    print(
+        f"  items: {outcome.items_succeeded} succeeded, {outcome.items_failed} failed, "
+        f"{outcome.resumed_items} resumed of {outcome.items_total}"
+    )
+    print(
+        f"  workers: {outcome.workers_spawned} spawned within "
+        f"[{settings.min_workers}, {settings.max_workers}]"
+    )
+    print(f"  {spend.render()}")
+    if queued:
+        print(f"  learnings queued for replay: {len(queued)}")
+        for decision in decisions:
+            print(
+                f"  decision: {decision.learning_id}  [{decision.stage.value}]  {decision.reason}"
+            )
+        pending = ApprovalLog(store_root).pending()
+        if pending:
+            print(
+                f"next: {len(pending)} proposal(s) await human approval "
+                f"(evogine approvals list --root {store_root})"
+            )
+    if outcome.outcome == "refused":
+        return 1
+    if outcome.outcome == "failed" or any(
+        decision.stage is DecisionStage.GATE_ERROR for decision in decisions
+    ):
+        return 2
     return 0

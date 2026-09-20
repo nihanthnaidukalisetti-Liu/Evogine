@@ -17,8 +17,10 @@ Bounds come from the unified config (``WorkerPoolSettings.min_workers`` /
 Dependencies come from the plan. Python really does contain import
 cycles, so when every pending item is blocked and none is running, the
 scheduler designates the highest-priority pending item a **cycle
-breaker** and runs it liveness-first: starvation is impossible, and the
-breaker designation is visible in the returned stats. Without a cycle the
+breaker** and runs it liveness-first. The designation is live only while
+the breaker runs: it retires the moment the breaker settles, so the next
+stuck event designates a fresh breaker — the mechanism cannot wedge
+behind a stale one, and starvation is impossible. Without a cycle the
 breaker logic never triggers — every item then runs strictly after its
 dependencies complete.
 """
@@ -88,6 +90,7 @@ class _ReadyQueue:
 
     @property
     def breakers(self) -> frozenset[str]:
+        """Item ids carrying a live breaker designation (empty once each settles)."""
         return frozenset(self._breakers)
 
     def settled_count(self) -> int:
@@ -97,10 +100,10 @@ class _ReadyQueue:
         return self.settled_count() + len(self._running) == len(self._order)
 
     def _unblocked(self, item: WorkItem) -> bool:
-        return all(
-            dep in self._done or dep in self._failed or dep in self._breakers
-            for dep in item.dependencies
-        )
+        # A breaker designation is not a settlement: dependents wait for the
+        # breaker to actually finish, so no item ever runs ahead of a
+        # dependency that is merely designated (or still running).
+        return all(dep in self._done or dep in self._failed for dep in item.dependencies)
 
     def _take_locked(self) -> WorkItem | None:
         for item in self._order:
@@ -122,12 +125,20 @@ class _ReadyQueue:
     def break_cycle_if_stuck(self) -> str | None:
         """Designate the top-priority blocked item a cycle breaker.
 
-        Called when no item is takeable, not everything is settled, and no
-        breaker is pending — the signature of an import cycle among the
-        remaining items. Returns the designated item id, or ``None`` when
-        a breaker is already designated or nothing remains.
+        Called when no item is takeable and not everything is settled. Fires
+        only when the pool is truly stuck — nothing takeable, nothing in
+        flight, no live breaker — the signature of an import cycle among the
+        remaining items. While any item is in flight its completion can
+        unblock waiters, so designating then would run an item ahead of its
+        own dependencies.
+
+        Returns the designated item id, or ``None`` when the pool is not
+        stuck (work in flight, a breaker already outstanding, or nothing
+        remaining). The designation is retired by :meth:`complete` when the
+        breaker settles, so a later stuck event — another cycle downstream —
+        designates a fresh breaker instead of parking behind a stale one.
         """
-        if self._breakers:
+        if self._running or self._breakers:
             return None
         for item in self._order:
             if (
@@ -143,6 +154,10 @@ class _ReadyQueue:
         return None
 
     def complete(self, item_id: str, failed: bool) -> None:
+        # Retire a live breaker designation with the breaker's settlement:
+        # the promise "this item runs next" is fulfilled, and a stale entry
+        # would make every future stuck event wait forever (the D1 wedge).
+        self._breakers.discard(item_id)
         self._running.discard(item_id)
         (self._failed if failed else self._done).add(item_id)
 

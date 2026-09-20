@@ -21,6 +21,7 @@ import uvicorn
 from evogine.console.app import create_app
 from evogine.console.launch import (
     ConsoleError,
+    load_sync_endpoints,
     resolve_bind_host,
     validate_operator,
     validate_root,
@@ -36,14 +37,19 @@ def serve(
     host: str = "127.0.0.1",
     port: int = DEFAULT_PORT,
     swarm_runs_root: str | None = None,
+    imports_dir: str | None = None,
+    sync_config: str | None = None,
 ) -> int:
     """Validate the launch and run the console until the operator interrupts it.
 
     Returns 0 after a clean shutdown; refusals raise :class:`ConsoleError`
     before the server starts, so the process exit is the operator's first
-    feedback, not a half-open socket. An explicit ``swarm_runs_root`` must
-    exist — a typo'd override would otherwise render a confident empty
-    board for the wrong directory.
+    feedback, not a half-open socket. An explicit ``swarm_runs_root`` or
+    ``imports_dir`` must exist — a typo'd override would otherwise render a
+    confident empty panel for the wrong directory. ``sync_config`` is a
+    config file whose default profile's sync endpoints the stores-and-sync
+    selector reads as read-only remote sources; a config that refuses to
+    load refuses the launch.
     """
     store_root = validate_root(root)
     identity = validate_operator(operator)
@@ -51,8 +57,17 @@ def serve(
         raise ConsoleError(f"port must be in 1-65535, got {port}")
     if swarm_runs_root is not None and not Path(swarm_runs_root).is_dir():
         raise ConsoleError(f"swarm runs root does not exist: {swarm_runs_root}")
+    if imports_dir is not None and not Path(imports_dir).is_dir():
+        raise ConsoleError(f"import bundles directory does not exist: {imports_dir}")
+    sync_endpoints = load_sync_endpoints(sync_config)
     bind_host = resolve_bind_host(host)
-    app = create_app(store_root, identity, swarm_runs_root=swarm_runs_root)
+    app = create_app(
+        store_root,
+        identity,
+        swarm_runs_root=swarm_runs_root,
+        imports_dir=imports_dir,
+        sync_endpoints=sync_endpoints,
+    )
     uvicorn.run(app, host=bind_host, port=port, log_level="info")
     return 0
 
@@ -82,6 +97,18 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="swarm run-directory root the board reads (default: <root>/runs/swarm)",
     )
+    parser.add_argument(
+        "--imports-dir",
+        default=None,
+        help="directory the knowledge-injection panel reads export bundles from "
+        "(default: <root>/imports)",
+    )
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="config file whose default profile's sync endpoints the stores-and-sync "
+        "selector reads as read-only remote sources (default: no remotes)",
+    )
     args = parser.parse_args(argv)
     try:
         return serve(
@@ -90,6 +117,8 @@ def main(argv: list[str] | None = None) -> int:
             host=args.host,
             port=args.port,
             swarm_runs_root=args.swarm_runs_root,
+            imports_dir=args.imports_dir,
+            sync_config=args.config,
         )
     except ConsoleError as exc:
         print(f"error: {exc}", file=sys.stderr)

@@ -1,0 +1,93 @@
+{% extends "base.html" %}
+{% block title %}{{ view.filename }} · Evogine Console{% endblock %}
+{% block content %}
+<h2>Import bundle <code>{{ view.filename }}</code></h2>
+<p class="muted"><a href="/injection">← all bundles</a></p>
+
+{% if view.applied_count is not none %}
+<div class="applied-panel">
+  <p><span class="pill pass">import applied</span></p>
+  <p>
+    {{ view.applied_count }} record(s) landed as <strong>candidates</strong> in this store —
+    manifest and provenance verbatim, one <code>import:</code> event on the audit trail. Each one
+    now faces this store's memory gate and a human approval in the
+    <a href="/approvals">approvals queue</a> before promotion. Re-importing this bundle refuses:
+    ids are never overwritten.
+  </p>
+</div>
+{% endif %}
+
+{% if view.refusal %}
+<div class="refusal-panel">
+  <p><span class="pill fail">import refused</span></p>
+  <p>{{ view.refusal }}</p>
+  <p class="muted">Nothing was written to the store.</p>
+</div>
+
+{% else %}
+  {% if view.summary %}
+  <table>
+    <tr><th>Source store</th><td><code>{{ view.summary.source_store }}</code></td></tr>
+    <tr><th>Exported at</th><td>{{ view.summary.exported_at }}</td></tr>
+    <tr><th>Schema version</th><td><code>v{{ view.summary.schema_version }}</code></td></tr>
+    <tr><th>Records</th><td>{{ view.summary.record_count }}</td></tr>
+    <tr><th>Qualified ids</th><td>
+      {% for qid in view.summary.qualified_ids %}<code>{{ qid }}</code>{% if not loop.last %} · {% endif %}{% endfor %}
+    </td></tr>
+  </table>
+  {% endif %}
+
+  {% if view.applied_count is not none %}
+  <h3>What this import landed</h3>
+  <table>
+    <tr><th>Qualified id</th><th>Landed record</th><th>Type</th><th>Title</th></tr>
+    {% for landing in view.landings %}
+    <tr>
+      <td><code>{{ landing.qualified_id }}</code></td>
+      <td><code>{{ landing.record_id }}</code></td>
+      <td>{{ landing.learning_type }}</td>
+      <td>{{ landing.title }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  <p class="muted">Awaiting this store's gate and a human approval — candidates are not promoted knowledge.</p>
+
+  {% elif view.conflicts %}
+  <div class="refusal-panel">
+    <p><span class="pill fail">import refused — conflicts with this store</span></p>
+    <ul>
+      {% for conflict in view.conflicts %}<li>{{ conflict }}</li>{% endfor %}
+    </ul>
+    <p class="muted">
+      Nothing was written to the store. An import never overwrites an id — re-exporting with the
+      same ids cannot resolve this; the records must stay distinct or be merged on the source side.
+    </p>
+  </div>
+
+  {% else %}
+  <h3>Dry run — what a confirmed import lands</h3>
+  <p class="muted">Nothing is written yet. Each record below lands as a <strong>new candidate</strong> —
+  full lifecycle and evidence, provenance from <code>{{ view.summary.source_store }}</code> — and then
+  faces this store's memory gate and a human approval before any promotion.</p>
+  <table>
+    <tr><th>Qualified id</th><th>Record id</th><th>Type</th><th>Title</th><th>Confidence</th></tr>
+    {% for landing in view.landings %}
+    <tr>
+      <td><code>{{ landing.qualified_id }}</code></td>
+      <td><code>{{ landing.record_id }}</code></td>
+      <td>{{ landing.learning_type }}</td>
+      <td>{{ landing.title }}</td>
+      <td>{{ landing.confidence }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  <form method="post" action="/injection/apply" class="decide">
+    <input type="hidden" name="bundle" value="{{ view.filename }}">
+    <input type="hidden" name="confirmed" value="yes">
+    <button type="submit">Confirm import — land {{ view.landings | length }} record(s) as candidates</button>
+  </form>
+  <p class="muted">Nothing lands without this confirmation. This is the landing boundary; the
+  promotion boundary stays the approvals queue.</p>
+  {% endif %}
+{% endif %}
+{% endblock %}

@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}Stores &amp; sync · Evogine Console{% endblock %}
+{% block content %}
+<h2>Stores &amp; sync</h2>
+<p class="muted">
+  One console, many store contexts. The selector picks which store this console's read-only views
+  read: the local store, or a configured sync remote through the sync client's query API. It never
+  changes what any page <em>writes</em> — approval decisions and imports always act on the local
+  store, through the same guarded paths as before.
+</p>
+<div class="sources-bar">
+  <span class="meta-label">store context:</span>
+  {% for link in sources_bar %}
+    {% if link.selected %}<strong class="pill source-selected">{{ link.label }}</strong>
+    {% else %}<a class="source-link" href="{{ link.href }}">{{ link.label }}</a>{% endif %}
+  {% endfor %}
+</div>
+<table>
+  <tr><th>Source</th><th>Store</th><th>Reachable</th><th>Overview</th><th>Machine spend</th><th>Audit position</th></tr>
+  {% for row in view.sources %}
+  <tr>
+    <td>
+      <code>{{ row.name }}</code>
+      {% if row.kind == "local" %}<span class="pill pass">local</span>{% else %}<span class="pill">remote</span>{% endif %}
+    </td>
+    <td><code>{{ row.store }}</code>{% if row.url %}<div class="muted">{{ row.url }}</div>{% endif %}</td>
+    <td>
+      {% if row.reachable %}<span class="pill pass">reachable</span>
+      {% else %}<span class="pill fail">refused</span>
+        {% if row.note %}<div class="muted">{{ row.note }}</div>{% endif %}
+      {% endif %}
+    </td>
+    <td>
+      {% if row.total_decisions is not none %}
+        {{ row.total_decisions }} decision(s) · {{ row.promoted }} promoted · {{ row.pending_approvals }} pending
+      {% else %}<span class="empty">no overview served</span>{% endif %}
+    </td>
+    <td>
+      {% if row.recorded_runs is not none %}
+        {% if row.actual_cost_usd is not none %}${{ row.actual_cost_usd }} across {{ row.recorded_runs }} run(s)
+        {% else %}no spend recorded ({{ row.recorded_runs }} run(s)){% endif %}
+      {% elif row.kind == "local" %}<span class="muted">— per-run spend lives on the <a href="/swarm">swarm board</a></span>
+      {% else %}<span class="empty">no spend served</span>{% endif %}
+    </td>
+    <td>
+      {% if row.audit_seq is not none %}seq {{ row.audit_seq }}{% if row.audit_ts %} · {{ row.audit_ts }}{% endif %}
+      {% elif row.audit_note %}<span class="empty">{{ row.audit_note }}</span>
+      {% else %}—{% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+{% if not remotes_configured %}
+<p class="empty">
+  No sync remotes configured — add endpoints under <code>profiles.&lt;name&gt;.sync.endpoints</code>
+  in a config file and relaunch with <code>--config</code> to read them here.
+</p>
+{% endif %}
+{% endblock %}

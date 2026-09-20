@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}Knowledge injection · Evogine Console{% endblock %}
+{% block content %}
+<h2>Knowledge injection</h2>
+<p class="muted">
+  Cross-project knowledge lands here as <strong>reviewed import bundles</strong> — the same
+  manifests <code>evogine memory export</code> writes. Every import is the reviewed flow:
+  summary first, a dry run that writes nothing, then one explicit confirmation. Landed records
+  are <strong>candidates</strong>: they face this store's memory gate and a human approval in the
+  <a href="/approvals">approvals queue</a> before promotion — the console never writes promoted
+  knowledge, and there is no path around that boundary.
+</p>
+{% if not view.dir_present %}
+<p class="empty">
+  No import bundles directory at <code>{{ view.imports_dir }}</code> — nothing was exported yet.
+  Point an export at it:
+  <code>evogine memory export --store &lt;source&gt; --root &lt;source-root&gt; --out {{ view.imports_dir }}/&lt;name&gt;.json</code>
+</p>
+{% elif not view.bundles %}
+<p class="empty">No export bundles in <code>{{ view.imports_dir }}</code> yet — the panel is empty, not hidden.</p>
+{% else %}
+{% for row in view.bundles %}
+<div class="bundle-card">
+  <h3><a href="/injection/bundles/{{ row.filename }}"><code>{{ row.filename }}</code></a></h3>
+  {% if row.refusal %}
+  <div class="refusal-panel">
+    <p><span class="pill fail">import refused</span></p>
+    <p>{{ row.refusal }}</p>
+    <p class="muted">Nothing was written to the store. The bundle must be re-exported to fix this.</p>
+  </div>
+  {% elif row.summary %}
+  <table>
+    <tr><th>Source store</th><td><code>{{ row.summary.source_store }}</code></td></tr>
+    <tr><th>Exported at</th><td>{{ row.summary.exported_at }}</td></tr>
+    <tr><th>Schema version</th><td><code>v{{ row.summary.schema_version }}</code></td></tr>
+    <tr><th>Records</th><td>{{ row.summary.record_count }}</td></tr>
+    <tr><th>Qualified ids</th><td>
+      {% for qid in row.summary.qualified_ids %}<code>{{ qid }}</code>{% if not loop.last %} · {% endif %}{% endfor %}
+    </td></tr>
+  </table>
+  <p><a href="/injection/bundles/{{ row.filename }}">Review dry run →</a></p>
+  {% endif %}
+</div>
+{% endfor %}
+{% endif %}
+{% endblock %}

@@ -218,12 +218,41 @@ format. Consequences:
 The console is a localhost-only surface over telemetry that already
 exists (no second computation): overview, decisions with detail pages,
 approvals, the audit timeline, and the proposal-funnel panel are
-read-only; exactly two write routes decide one proposal each
-(`POST /approvals/{id}/approve|reject`), recording the operator identity
+read-only; guarded write routes decide one proposal each
+(`POST /approvals/{id}/approve|reject`) and land reviewed knowledge
+bundles (the injection panel's confirm), recording the operator identity
 the console was launched with. Launch-time refusals cover a root that is
 not a store, an empty operator identity, and any non-loopback bind —
 there is no auth stack, so machine possession is the trust anchor and a
 non-loopback bind is refused before any socket exists.
+
+The knowledge-injection panel is the read-side view of the same reviewed
+transfer flow the `memory export`/`import` CLI drives: it lists export
+bundles from a conventional directory (`<store>/import-bundles`,
+override with `--imports-dir` at launch), renders each bundle's manifest
+— source store, schema version, per-record qualified ids — before any
+action, and offers exactly one write: the import command's own dry run,
+then a confirm POST that lands candidates through `apply_import` under
+the store's advisory lock. Every refusal is a panel with the store
+untouched: an invalid manifest, a wrong schema version, duplicate
+qualified ids, a destination collision, an import from the store's own
+identity, and a confirm that skipped the dry run (an unapproved
+injection) each render the transfer module's reason verbatim —
+all-or-nothing, like the CLI. Landed records are candidates carrying the
+source record's provenance byte-for-byte; promotion still faces this
+store's gate and the approvals queue, so injection cannot bypass it.
+
+The stores-and-sync selector chooses which store context the read-only
+pages target: the local store, plus any sync remotes configured through
+`--config` (the default profile's `sync.endpoints`, resolved at launch,
+refusing a config that does not load). It changes what pages read, never
+what they write — writes stay bound to the local store. The `/sources`
+page renders per-source health from the existing sync client:
+reachability, the query API's decision counts and fleet spend, the last
+local audit position (remote trails are never stitched into one
+sequence), and an explicit refusal row for a remote that will not answer.
+Selecting a remote that refuses re-renders the overview as a refusal with
+the client's reason, never a blank page.
 
 ## Configuration
 

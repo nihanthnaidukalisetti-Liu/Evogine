@@ -54,6 +54,10 @@ unattended promotion remain out of scope by design.
 - Localhost-only read-only operator console (#16), the proposal-funnel panel
   with CLI parity (#23), and approval write paths over the human-approval
   boundary (#24).
+- Console knowledge-injection panel over the reviewed-manifest import flow —
+  manifest summaries before any action, refusals as visible panels, and one
+  guarded confirm landing candidates — plus the stores-and-sync selector for
+  read-only views over the local store and configured sync remotes.
 
 **Sync and onboarding (V4)**
 

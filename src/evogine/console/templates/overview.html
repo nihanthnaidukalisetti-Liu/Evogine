@@ -1,6 +1,34 @@
 {% extends "base.html" %}
-{% block title %}Overview · Evogine Console{% endblock %}
+{% block title %}Overview{% if remote %} · {{ remote.name }}{% endif %} · Evogine Console{% endblock %}
 {% block content %}
+{% if remote %}
+<h2>Overview — remote source <code>{{ remote.name }}</code></h2>
+<p class="muted">
+  Read over the sync client's query API at <code>{{ remote.url }}</code> (store
+  <code>{{ remote.store }}</code>). A remote context is read-only: this console's approval decisions
+  and imports always act on the local store. The remote's audit trail is not served by the query
+  API — per-store trails are never stitched into one sequence (governance §3.3); see its position
+  on the <a href="/sources">stores page</a>.
+</p>
+<p>
+  {{ remote.overview.total_decisions }} promotion decision(s) &middot;
+  {{ remote.overview.promoted }} cleared for promotion &middot;
+  {{ remote.overview.pending_approvals }} approval(s) pending on the remote.
+</p>
+<table>
+  <tr><th>Gate stage</th><th>Decisions</th></tr>
+  {% for stage, count in remote.overview.by_stage.items() %}<tr><td>{{ stage }}</td><td>{{ count }}</td></tr>{% endfor %}
+  <tr><th>Total</th><th>{{ remote.overview.total_decisions }}</th></tr>
+</table>
+<h3>Machine spend</h3>
+<p>
+  {% if remote.spend.actual_cost_usd is not none %}${{ remote.spend.actual_cost_usd }} across {{ remote.spend.recorded_runs }} run(s)
+  {% else %}no spend recorded ({{ remote.spend.recorded_runs }} run(s)){% endif %}
+  {% if remote.spend.overage_usd is not none %} &middot; overage ${{ remote.spend.overage_usd }}{% endif %}
+</p>
+<p class="muted">Reported by the remote's own spend reconciliation, through its query API — the
+console never re-aggregates it.</p>
+{% else %}
 <h2>Overview</h2>
 <p>
   {{ counts.total_decisions }} promotion decision(s) &middot;
@@ -13,4 +41,5 @@
   <tr><th>Total</th><th>{{ counts.total_decisions }}</th></tr>
 </table>
 <p class="muted">Counts by stage match <code>evogine decisions report --root {{ root }}</code> for this store.</p>
+{% endif %}
 {% endblock %}

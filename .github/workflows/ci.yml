@@ -156,7 +156,7 @@ jobs:
       # pages and the write path in one measurement.
       - name: Console route tests with package coverage floor
         run: >
-          pytest tests/test_console.py tests/test_console_funnel.py tests/test_console_swarm.py tests/test_console_write.py -q
+          pytest tests/test_console.py tests/test_console_funnel.py tests/test_console_swarm.py tests/test_console_write.py tests/test_console_injection.py -q
           --cov=evogine.console --cov-report=term-missing --cov-fail-under=90
 
   # The sync daemon is optional transport behind the [server] extra: the core

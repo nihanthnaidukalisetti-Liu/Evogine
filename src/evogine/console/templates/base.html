@@ -30,6 +30,14 @@
   .muted { color: #667085; }
   .empty { color: #667085; font-style: italic; padding: 0.75rem 0; }
   .error { color: #b42318; }
+  .refusal-panel { border: 1px solid #b42318; background: #fdf0ee; padding: 0.6rem 0.9rem; margin: 0.6rem 0; }
+  .refusal-panel p { margin: 0.3rem 0; }
+  .applied-panel { border: 1px solid #067647; background: #eef8f1; padding: 0.6rem 0.9rem; margin: 0.6rem 0; }
+  .applied-panel p { margin: 0.3rem 0; }
+  .bundle-card { border: 1px solid #e2e6ea; background: #fff; padding: 0.5rem 0.9rem; margin: 0.8rem 0; }
+  .sources-bar { background: #eef1f4; border: 1px solid #e2e6ea; padding: 0.35rem 0.9rem; margin: 0 0 0.8rem; display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; font-size: 0.85rem; }
+  .source-link { text-decoration: none; }
+  .source-selected { background: #1d2939; color: #fff; }
   form.decide { display: flex; gap: 0.35rem; margin: 0.15rem 0; align-items: center; }
   form.decide input[type="text"] { flex: 1; min-width: 10rem; padding: 0.2rem 0.4rem; font-size: 0.82rem; border: 1px solid #d0d5dd; }
   form.decide button { padding: 0.2rem 0.6rem; font-size: 0.82rem; cursor: pointer; border: 1px solid #175cd3; background: #175cd3; color: #fff; border-radius: 4px; }
@@ -52,7 +60,19 @@
   <a href="/loop">Loop</a>
   <a href="/approvals">Approvals</a>
   <a href="/audit">Audit</a>
+  <a href="/injection">Injection</a>
+  <a href="/sources">Stores &amp; sync</a>
 </nav>
+{% if sources_bar %}
+<div class="sources-bar">
+  <span class="meta">store context:</span>
+  {% for link in sources_bar %}
+    {% if link.selected %}<strong class="pill source-selected">{{ link.label }}</strong>
+    {% else %}<a class="source-link" href="{{ link.href }}">{{ link.label }}</a>{% endif %}
+  {% endfor %}
+  <span class="meta">selector is read-only — decisions and imports always act on the local store</span>
+</div>
+{% endif %}
 <main>
 {% block content %}{% endblock %}
 </main>
